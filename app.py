@@ -155,6 +155,10 @@ st.markdown("""
         padding: 1.3rem 1.5rem;
         box-shadow: 0 10px 30px rgba(15, 23, 42, 0.12);
         transition: box-shadow 0.25s ease, transform 0.25s ease;
+        min-height: 175px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
     }
     
     .metric-card:hover {
@@ -378,7 +382,6 @@ def show_login_form():
         icon="🔐",
     )
     st.markdown('<div class="auth-form">', unsafe_allow_html=True)
-    st.markdown('<div class="auth-header"><h2>🔐 ENERMERLION DYNAMIC EMS LOGIN</h2></div>', unsafe_allow_html=True)
     
     with st.form("login_form"):
         username = st.text_input("👤 USERNAME", placeholder="Enter your username")
@@ -417,7 +420,6 @@ def show_register_form():
         login_style=True,
     )
     st.markdown('<div class="auth-form">', unsafe_allow_html=True)
-    st.markdown('<div class="auth-header"><h2>🚀 CREATE INDUSTRIAL ACCOUNT</h2></div>', unsafe_allow_html=True)
     
     with st.form("register_form"):
         username = st.text_input("👤 USERNAME", placeholder="Choose a username")

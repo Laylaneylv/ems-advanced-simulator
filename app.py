@@ -39,6 +39,18 @@ try:
 except ImportError:
     pass
 
+
+def _format_simulation_date(value):
+    """Format simulation timestamp from Supabase/SQLite."""
+    if value is None:
+        return "Unknown date"
+    if isinstance(value, str):
+        return value.split()[0]
+    try:
+        return value.strftime("%Y-%m-%d")
+    except AttributeError:
+        return str(value)
+
 # Initialize database
 init_db()
 
@@ -514,11 +526,15 @@ with st.sidebar:
         simulations = get_user_simulations(st.session_state.current_user['id'])
         if simulations:
             st.markdown("**Recent Projects:**")
+            display_options = [
+                f"{name} ({_format_simulation_date(date)})"
+                for sim_id, name, date in simulations
+            ]
             
             # 垂直布局 - 更清晰
             selected_project = st.selectbox(
                 "Select a project to load:",
-                options=[f"{name} ({date.split()[0]})" for sim_id, name, date in simulations],
+                options=display_options,
                 format_func=lambda x: x,
                 key="project_selector"
             )
@@ -526,7 +542,7 @@ with st.sidebar:
             # 全宽按钮
             if st.button("📂 LOAD SELECTED PROJECT", use_container_width=True):
                 # 找到选中的项目
-                selected_index = [f"{name} ({date.split()[0]})" for sim_id, name, date in simulations].index(selected_project)
+                selected_index = display_options.index(selected_project)
                 selected_sim_id = simulations[selected_index][0]
                 
                 # 加载项目数据
@@ -543,8 +559,8 @@ with st.sidebar:
             
             # 项目列表（可选）
             with st.expander("📋 Quick Load - Recent Projects", expanded=False):
-                for i, (sim_id, name, date) in enumerate(simulations[:5]):  # 只显示最近5个
-                    if st.button(f"📁 {name} ({date.split()[0]})", key=f"load_{sim_id}", use_container_width=True):
+                for (sim_id, name, date), display_name in zip(simulations[:5], display_options[:5]):  # 只显示最近5个
+                    if st.button(f"📁 {display_name}", key=f"load_{sim_id}", use_container_width=True):
                         project_data = get_simulation_details(sim_id)
                         if project_data:
                             st.session_state.loaded_project = project_data

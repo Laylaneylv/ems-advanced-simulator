@@ -11,16 +11,183 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import io
 from datetime import datetime
+import json
+import hashlib
+import os
+import sqlite3
+from pathlib import Path
 from ems_engine import EMSEngine
 
 # Page configuration
 st.set_page_config(
-    page_title="EMS Industrial Simulator",
+    page_title="ENERMERLION DYNAMIC EMS Simulator",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
+# Database setup
+def init_db():
+    """Initialize SQLite database for user data"""
+    conn = sqlite3.connect('ems_users.db')
+    c = conn.cursor()
+    
+    # Users table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            company TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login TIMESTAMP
+        )
+    ''')
+    
+    # User sessions table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS user_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            session_data TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    
+    # Simulation results table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS simulation_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            project_name TEXT,
+            simulation_data TEXT,
+            config_data TEXT,
+            results_data TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+# Initialize database
+init_db()
+
+# Password hashing
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+# User authentication functions
+def create_user(username, email, password, company):
+    """Create a new user account"""
+    try:
+        conn = sqlite3.connect('ems_users.db')
+        c = conn.cursor()
+        password_hash = hash_password(password)
+        c.execute(
+            'INSERT INTO users (username, email, password_hash, company) VALUES (?, ?, ?, ?)',
+            (username, email, password_hash, company)
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+def verify_user(username, password):
+    """Verify user credentials"""
+    conn = sqlite3.connect('ems_users.db')
+    c = conn.cursor()
+    password_hash = hash_password(password)
+    c.execute(
+        'SELECT id, username, email, company FROM users WHERE username = ? AND password_hash = ?',
+        (username, password_hash)
+    )
+    user = c.fetchone()
+    conn.close()
+    
+    if user:
+        return {
+            'id': user[0],
+            'username': user[1],
+            'email': user[2],
+            'company': user[3]
+        }
+    return None
+
+def save_simulation_result(user_id, project_name, config, results):
+    """Save simulation results to database"""
+    try:
+        conn = sqlite3.connect('ems_users.db')
+        c = conn.cursor()
+        
+        # 转换DataFrame为可序列化的字典
+        serializable_results = results.copy()
+        if 'data' in serializable_results and isinstance(serializable_results['data'], pd.DataFrame):
+            serializable_results['data'] = serializable_results['data'].to_dict('records')
+        
+        c.execute(
+            '''INSERT INTO simulation_results 
+                (user_id, project_name, config_data, results_data) 
+                VALUES (?, ?, ?, ?)''',
+            (user_id, project_name, json.dumps(config), json.dumps(serializable_results, default=str))
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        st.error(f"Error saving simulation: {e}")
+        return False
+
+def get_user_simulations(user_id):
+    """Get all simulations for a user"""
+    conn = sqlite3.connect('ems_users.db')
+    c = conn.cursor()
+    c.execute(
+        'SELECT id, project_name, created_at FROM simulation_results WHERE user_id = ? ORDER BY created_at DESC',
+        (user_id,)
+    )
+    simulations = c.fetchall()
+    conn.close()
+    return simulations
+def get_simulation_details(simulation_id):
+    """Get detailed simulation data by ID"""
+    try:
+        conn = sqlite3.connect('ems_users.db')
+        c = conn.cursor()
+        c.execute(
+            'SELECT project_name, config_data, results_data FROM simulation_results WHERE id = ?',
+            (simulation_id,)
+        )
+        result = c.fetchone()
+        conn.close()
+        
+        if result:
+            project_name, config_data, results_data = result
+            
+            # 转换回DataFrame
+            config = json.loads(config_data)
+            results = json.loads(results_data)
+            
+            # 如果data是字典格式，转换回DataFrame
+            if 'data' in results and isinstance(results['data'], list):
+                results['data'] = pd.DataFrame(results['data'])
+                # 转换timestamp列回datetime
+                if 'timestamp' in results['data'].columns:
+                    results['data']['timestamp'] = pd.to_datetime(results['data']['timestamp'])
+            
+            return {
+                'project_name': project_name,
+                'config': config,
+                'results': results
+            }
+        return None
+    except Exception as e:
+        st.error(f"Error loading project: {e}")
+        return None
 # Cement & Concrete Industrial CSS
 st.markdown("""
 <style>
@@ -90,6 +257,23 @@ st.markdown("""
         border-radius: 8px;
         padding: 1.5rem;
         margin: 1rem 0;
+        color: #2d3748;
+    }
+    
+    /* Auth Form Styling */
+    .auth-form {
+        background: linear-gradient(135deg, #f7fafc 0%, #edf2f7 100%);
+        border: 2px solid #e2e8f0;
+        border-radius: 12px;
+        padding: 2rem;
+        margin: 2rem auto;
+        max-width: 500px;
+        box-shadow: 0 8px 25px -8px rgba(0, 0, 0, 0.1);
+    }
+    
+    .auth-header {
+        text-align: center;
+        margin-bottom: 2rem;
         color: #2d3748;
     }
     
@@ -172,17 +356,138 @@ if 'simulation_run' not in st.session_state:
     st.session_state.simulation_run = False
 if 'results' not in st.session_state:
     st.session_state.results = None
+if 'include_pv_savings' not in st.session_state:
+    st.session_state.include_pv_savings = True
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+if 'current_user' not in st.session_state:
+    st.session_state.current_user = None
+if 'show_login' not in st.session_state:
+    st.session_state.show_login = True
+if 'show_register' not in st.session_state:
+    st.session_state.show_register = False
+if 'loaded_project' not in st.session_state:  # NEW: For loaded projects
+    st.session_state.loaded_project = None
 
+# Authentication functions
+def show_login_form():
+    """Display login form"""
+    st.markdown('<div class="auth-form">', unsafe_allow_html=True)
+    st.markdown('<div class="auth-header"><h2>🔐 ENERMERLION DYNAMIC EMS LOGIN</h2></div>', unsafe_allow_html=True)
+    
+    with st.form("login_form"):
+        username = st.text_input("👤 USERNAME", placeholder="Enter your username")
+        password = st.text_input("🔒 PASSWORD", type="password", placeholder="Enter your password")
+        login_button = st.form_submit_button("🚀 LOGIN", use_container_width=True)
+        
+        if login_button:
+            if username and password:
+                user = verify_user(username, password)
+                if user:
+                    st.session_state.authenticated = True
+                    st.session_state.current_user = user
+                    st.session_state.show_login = False
+                    st.success(f"✅ Welcome back, {user['username']}!")
+                    st.rerun()
+                else:
+                    st.error("❌ Invalid username or password")
+            else:
+                st.error("❌ Please fill in all fields")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("📝 CREATE ACCOUNT", use_container_width=True):
+            st.session_state.show_login = False
+            st.session_state.show_register = True
+            st.rerun()
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+
+def show_register_form():
+    """Display registration form"""
+    st.markdown('<div class="auth-form">', unsafe_allow_html=True)
+    st.markdown('<div class="auth-header"><h2>🚀 CREATE INDUSTRIAL ACCOUNT</h2></div>', unsafe_allow_html=True)
+    
+    with st.form("register_form"):
+        username = st.text_input("👤 USERNAME", placeholder="Choose a username")
+        email = st.text_input("📧 EMAIL", placeholder="Enter your email")
+        company = st.text_input("🏢 COMPANY", placeholder="Your company name")
+        password = st.text_input("🔒 PASSWORD", type="password", placeholder="Create a password")
+        confirm_password = st.text_input("✅ CONFIRM PASSWORD", type="password", placeholder="Confirm your password")
+        
+        register_button = st.form_submit_button("🚀 CREATE ACCOUNT", use_container_width=True)
+        
+        if register_button:
+            if not all([username, email, password, confirm_password]):
+                st.error("❌ Please fill in all required fields")
+            elif password != confirm_password:
+                st.error("❌ Passwords do not match")
+            elif len(password) < 6:
+                st.error("❌ Password must be at least 6 characters")
+            else:
+                success = create_user(username, email, password, company)
+                if success:
+                    st.success("✅ Account created successfully! Please login.")
+                    st.session_state.show_register = False
+                    st.session_state.show_login = True
+                    st.rerun()
+                else:
+                    st.error("❌ Username or email already exists")
+    
+    if st.button("⬅️ BACK TO LOGIN", use_container_width=True):
+        st.session_state.show_register = False
+        st.session_state.show_login = True
+        st.rerun()
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+
+def logout():
+    """Logout user"""
+    st.session_state.authenticated = False
+    st.session_state.current_user = None
+    st.session_state.show_login = True
+    st.session_state.simulation_run = False
+    st.session_state.results = None
+    st.rerun()
+
+# Show authentication forms if not authenticated
+if not st.session_state.authenticated:
+    if st.session_state.show_login:
+        show_login_form()
+    elif st.session_state.show_register:
+        show_register_form()
+    
+    # Footer for auth pages
+    st.markdown("---")
+    st.markdown(
+        "<p style='text-align: center; color: #718096; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 1px;'>"
+        "ENERMERLION DYNAMIC EMS | SECURE SUCCESS | INDUSTRIAL GRADE"
+        "</p>", 
+        unsafe_allow_html=True
+    )
+    st.stop()
+
+# Main application - only shown when authenticated
 # Industrial Header Section
-st.markdown('<div class="main-header">⚡ EMS INDUSTRIAL SIMULATOR</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Precision Energy Management for Industrial Applications</div>', unsafe_allow_html=True)
+col1, col2, col3 = st.columns([3, 1, 1])
+with col1:
+    st.markdown('<div class="main-header">ENERMERLION DYNAMIC EMS SIMULATOR</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Precision Energy Management for Industrial Applications</div>', unsafe_allow_html=True)
+
+with col3:
+    st.markdown(f"**👤 Welcome, {st.session_state.current_user['username']}**")
+    if st.session_state.current_user['company']:
+        st.markdown(f"**🏢 {st.session_state.current_user['company']}**")
+    if st.button("🚪 LOGOUT", use_container_width=True):
+        logout()
 
 # Sidebar - Industrial Design
 with st.sidebar:
     st.markdown("### 🎯 PROJECT CONFIGURATION")
     
-    # Project Info
+    # Project Info with project name
     with st.expander("🌍 PROJECT LOCATION", expanded=True):
+        project_name = st.text_input("PROJECT NAME", value=f"Project_{datetime.now().strftime('%Y%m%d_%H%M')}")
         col1, col2 = st.columns(2)
         with col1:
             country = st.text_input("Country", value="Malaysia")
@@ -309,6 +614,64 @@ with st.sidebar:
             value=0.27, 
             step=0.01
         )
+        
+        # NEW: PV Savings Inclusion Option
+        st.markdown("#### 📊 ROI CALCULATION OPTIONS")
+        include_pv_savings = st.checkbox(
+            "INCLUDE PV ENERGY SAVINGS IN ROI",
+            value=True,
+            help="When checked, PV energy savings are included in ROI calculation. Uncheck for BESS-only analysis."
+        )
+        st.session_state.include_pv_savings = include_pv_savings
+
+    # User History Section
+        # User History Section
+        # User History Section
+    with st.expander("📁 MY SIMULATIONS", expanded=False):
+        simulations = get_user_simulations(st.session_state.current_user['id'])
+        if simulations:
+            st.markdown("**Recent Projects:**")
+            
+            # 垂直布局 - 更清晰
+            selected_project = st.selectbox(
+                "Select a project to load:",
+                options=[f"{name} ({date.split()[0]})" for sim_id, name, date in simulations],
+                format_func=lambda x: x,
+                key="project_selector"
+            )
+            
+            # 全宽按钮
+            if st.button("📂 LOAD SELECTED PROJECT", use_container_width=True):
+                # 找到选中的项目
+                selected_index = [f"{name} ({date.split()[0]})" for sim_id, name, date in simulations].index(selected_project)
+                selected_sim_id = simulations[selected_index][0]
+                
+                # 加载项目数据
+                project_data = get_simulation_details(selected_sim_id)
+                if project_data:
+                    st.session_state.loaded_project = project_data
+                    st.session_state.simulation_run = True
+                    st.session_state.results = project_data['results']
+                    st.session_state.include_pv_savings = project_data['config']['financial'].get('include_pv_savings', True)
+                    st.success(f"✅ Project '{project_data['project_name']}' loaded successfully!")
+                    st.rerun()
+                else:
+                    st.error("❌ Failed to load project data")
+            
+            # 项目列表（可选）
+            with st.expander("📋 Quick Load - Recent Projects", expanded=False):
+                for i, (sim_id, name, date) in enumerate(simulations[:5]):  # 只显示最近5个
+                    if st.button(f"📁 {name} ({date.split()[0]})", key=f"load_{sim_id}", use_container_width=True):
+                        project_data = get_simulation_details(sim_id)
+                        if project_data:
+                            st.session_state.loaded_project = project_data
+                            st.session_state.simulation_run = True
+                            st.session_state.results = project_data['results']
+                            st.session_state.include_pv_savings = project_data['config']['financial'].get('include_pv_savings', True)
+                            st.success(f"✅ Project '{project_data['project_name']}' loaded!")
+                            st.rerun()
+        else:
+            st.info("No simulations yet. Run your first analysis!")
 
 # Main Content Area
 if load_df is not None:
@@ -342,16 +705,29 @@ if load_df is not None:
                         'capex': capex,
                         'md_charge': md_charge,
                         'peak_energy_rate': peak_rate,
-                        'offpeak_energy_rate': offpeak_rate
+                        'offpeak_energy_rate': offpeak_rate,
+                        'include_pv_savings': st.session_state.include_pv_savings  # NEW: Pass the option to engine
                     }
                 }
                 
                 engine = EMSEngine(config)
                 results = engine.run_simulation(load_df)
                 
+                # Save simulation results to database
+                save_success = save_simulation_result(
+                    st.session_state.current_user['id'],
+                    project_name,
+                    config,
+                    results
+                )
+                
                 st.session_state.simulation_run = True
                 st.session_state.results = results
-                st.success("✅ SIMULATION COMPLETED")
+                
+                if save_success:
+                    st.success("✅ SIMULATION COMPLETED & SAVED")
+                else:
+                    st.success("✅ SIMULATION COMPLETED")
                 
             except Exception as e:
                 st.error(f"❌ SIMULATION ERROR: {e}")
@@ -359,9 +735,29 @@ if load_df is not None:
 # Display Results - Industrial Style
 if st.session_state.simulation_run and st.session_state.results is not None:
     results = st.session_state.results
-    
+    if st.session_state.loaded_project:
+        st.markdown(f"### 📁 LOADED PROJECT: {st.session_state.loaded_project['project_name']}")
+        if st.button("🔄 RETURN TO NEW SIMULATION", use_container_width=True):
+            st.session_state.loaded_project = None
+            st.session_state.simulation_run = False
+            st.session_state.results = None
+            st.rerun()
     st.markdown("---")
     st.markdown("## 📊 SIMULATION RESULTS")
+    
+    # Display PV Savings Inclusion Status
+    savings_status = "INCLUDED" if st.session_state.include_pv_savings else "EXCLUDED"
+    savings_color = "#38a169" if st.session_state.include_pv_savings else "#e53e3e"
+    st.markdown(f"""
+    <div style="background: linear-gradient(135deg, #f7fafc 0%, #edf2f7 100%); border: 2px solid {savings_color}; border-radius: 8px; padding: 1rem; margin-bottom: 1rem;">
+        <h4 style="margin: 0; color: {savings_color}; text-align: center;">
+            📊 ROI ANALYSIS: PV ENERGY SAVINGS {savings_status}
+        </h4>
+        <p style="text-align: center; margin: 0.5rem 0 0 0; color: #4a5568;">
+            { 'PV and BESS combined analysis' if st.session_state.include_pv_savings else 'BESS-only analysis (PV savings excluded)' }
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
     
     # Industrial Metric Cards
     col1, col2, col3, col4 = st.columns(4)
@@ -671,6 +1067,16 @@ if st.session_state.simulation_run and st.session_state.results is not None:
             st.metric("OFF-PEAK SAVINGS", f"RM {breakdown['offpeak_discharge_savings']:,.0f}")
         with col4:
             st.metric("PV SELF-CONSUMPTION", f"RM {breakdown['pv_self_consumption_savings']:,.0f}")
+        
+        # Display PV Savings Inclusion Note
+        if not st.session_state.include_pv_savings:
+            st.markdown(f"""
+            <div class="warning-box">
+                <h4>📊 NOTE: PV SAVINGS EXCLUDED</h4>
+                <p>PV energy savings are currently excluded from ROI calculations. This analysis shows BESS-only financial performance.</p>
+                <p><strong>PV Self-Consumption Savings:</strong> RM {breakdown['pv_self_consumption_savings']:,.0f} (excluded from totals)</p>
+            </div>
+            """, unsafe_allow_html=True)
     
     with tab4:
         st.markdown("#### 💡 OPTIMIZATION RECOMMENDATIONS")
@@ -710,6 +1116,8 @@ else:
         3. **🎯 SET TARGETS**: Define MD reduction goals
         4. **🚀 RUN SIMULATION**: Execute analysis
         5. **📈 REVIEW RESULTS**: Explore analytics
+        
+        **NEW FEATURE**: Choose whether to include PV energy savings in ROI calculations for BESS-only analysis.
         """)
     
     with col2:
@@ -728,7 +1136,7 @@ else:
 st.markdown("---")
 st.markdown(
     "<p style='text-align: center; color: #718096; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 1px;'>"
-    "EMS INDUSTRIAL SIMULATOR v3.0 | PRECISION ENGINEERING | BUILT FOR INDUSTRY"
+    "ENERMERLION DYNAMIC EMS SIMULATOR FROM EWISER_SG| APPLICATION ENGINEERING | BUILT FOR INDUSTRY"
     "</p>", 
     unsafe_allow_html=True
 )

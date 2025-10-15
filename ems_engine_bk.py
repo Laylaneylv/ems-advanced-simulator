@@ -22,7 +22,7 @@ class EMSEngine:
                 - location: {name, city, country}
                 - pv_system: {total_capacity_kwp, system_loss, inverter_capacity_kw}
                 - ems_config: {target_md, max_discharge_power, battery_capacity, initial_soe}
-                - financial: {capex, md_charge, peak_energy_rate, offpeak_energy_rate}
+                - financial: {capex, md_charge, peak_energy_rate, offpeak_energy_rate, include_pv_savings}
         """
         self.config = config
         self.controller = None
@@ -231,6 +231,9 @@ class EMSEngine:
         financial = self.config['financial']
         ems_config = self.config['ems_config']
         
+        # Get PV savings inclusion option (default to True if not specified)
+        include_pv_savings = financial.get('include_pv_savings', True)
+        
         # Calculate MD values (weekdays 2pm-10pm)
         billing_mask = results_df['timestamp'].apply(
             lambda x: 14 <= x.hour < 22 and x.weekday() < 5
@@ -291,14 +294,28 @@ class EMSEngine:
         monthly_offpeak_discharge_savings = daily_offpeak_discharge_savings * 30
         monthly_pv_savings = daily_pv_self_consumption_savings * 30
         
-        monthly_savings_for_roi = (
-            monthly_md_savings + 
-            monthly_peak_discharge_savings + 
-            monthly_offpeak_discharge_savings
-        )
-        annual_savings_for_roi = monthly_savings_for_roi * 12
+        # Calculate savings based on PV inclusion option
+        if include_pv_savings:
+            # Include PV savings in ROI calculations
+            monthly_savings_for_roi = (
+                monthly_md_savings + 
+                monthly_peak_discharge_savings + 
+                monthly_offpeak_discharge_savings +
+                monthly_pv_savings  # Include PV savings
+            )
+            annual_savings_for_roi = monthly_savings_for_roi * 12
+            monthly_total_savings = monthly_savings_for_roi
+        else:
+            # Exclude PV savings from ROI calculations (BESS-only analysis)
+            monthly_savings_for_roi = (
+                monthly_md_savings + 
+                monthly_peak_discharge_savings + 
+                monthly_offpeak_discharge_savings
+                # PV savings excluded
+            )
+            annual_savings_for_roi = monthly_savings_for_roi * 12
+            monthly_total_savings = monthly_savings_for_roi + monthly_pv_savings
         
-        monthly_total_savings = monthly_savings_for_roi + monthly_pv_savings
         annual_total_savings = monthly_total_savings * 12
         
         # Inverter Clipping Analysis
@@ -373,7 +390,8 @@ class EMSEngine:
                 'percentage': clipping_percentage,
                 'capacity_kw': inverter_capacity,
                 'energy_lost_kwh': energy_lost_kwh
-            }
+            },
+            'include_pv_savings': include_pv_savings  # Add this flag to results
         }
     
     def _generate_recommendations(self, analysis):

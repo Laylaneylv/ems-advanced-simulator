@@ -698,6 +698,17 @@ if st.session_state.simulation_run and st.session_state.results is not None:
             )
             st.markdown('</div>', unsafe_allow_html=True)
     
+    core_peak_mwh = results['analysis'].get('energy_metrics', {}).get('core_peak_discharge_mwh')
+    if core_peak_mwh is not None:
+        core_col, _ = st.columns([1, 3])
+        with core_col:
+            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+            st.metric(
+                "CORE PEAK SHAVING (18-22H)",
+                f"{core_peak_mwh:.2f} MWh"
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+    
     # System Alerts
     if 'inverter_clipping' in results['analysis']:
         clipping = results['analysis']['inverter_clipping']

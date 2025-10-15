@@ -376,11 +376,6 @@ if 'loaded_project' not in st.session_state:  # NEW: For loaded projects
 # Authentication functions
 def show_login_form():
     """Display login form"""
-    render_header_card(
-        title="ENERMERLION DYNAMIC EMS LOGIN",
-        subtitle="Secure industrial access",
-        icon="🔐",
-    )
     st.markdown('<div class="auth-form">', unsafe_allow_html=True)
     
     with st.form("login_form"):
@@ -413,12 +408,6 @@ def show_login_form():
 
 def show_register_form():
     """Display registration form"""
-    render_header_card(
-        title="Create Industrial Account",
-        subtitle="Provision secure access to EMS simulator",
-        icon="🛠️",
-        login_style=True,
-    )
     st.markdown('<div class="auth-form">', unsafe_allow_html=True)
     
     with st.form("register_form"):

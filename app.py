@@ -3,6 +3,12 @@ Energy Management System (EMS) Web Application
 Streamlit-based interface for EMS simulation and analysis
 Version 3.0 - Cement & Concrete Industrial Design
 """
+import os
+import streamlit as st
+
+st.sidebar.caption(f"DB env: {os.getenv('DATABASE_URL', 'NOT SET')[:60]}…")
+from database import engine
+st.sidebar.caption(f"Engine URL: {engine.url}")
 
 import streamlit as st
 import pandas as pd

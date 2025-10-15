@@ -3,6 +3,7 @@ headless = true
 port = 8501
 enableCORS = false
 address = "0.0.0.0"
+fileWatcherType = "none"
 
 [browser]
 gatherUsageStats = false

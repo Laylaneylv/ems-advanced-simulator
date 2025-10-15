@@ -51,6 +51,42 @@ def _format_simulation_date(value):
     except AttributeError:
         return str(value)
 
+
+def render_header_card(title: str, subtitle: str | None = None, icon: str | None = None, *, login_style: bool = False) -> None:
+    """Render a hero card style header."""
+    subtitle_html = f'<div class="hero-card-subtitle">{subtitle}</div>' if subtitle else ""
+    icon_html = f'<span class="icon">{icon}</span>' if icon else ""
+    extra_class = " hero-card-login" if login_style else ""
+    st.markdown(
+        f"""
+        <div class="hero-card{extra_class}">
+            <div class="hero-card-title">{icon_html}{title}</div>
+            {subtitle_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_metric_card(title: str, value: str, *, delta: str | None = None, delta_positive: bool | None = None) -> None:
+    """Render a metric card with consistent styling."""
+    delta_html = ""
+    if delta is not None:
+        delta_class = "metric-card-delta"
+        if delta_positive is not None:
+            delta_class += " positive" if delta_positive else " negative"
+        delta_html = f'<div class="{delta_class}">{delta}</div>'
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-card-title">{title}</div>
+            <div class="metric-card-value">{value}</div>
+            {delta_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 # Initialize database
 init_db()
 
@@ -113,18 +149,87 @@ st.markdown("""
     
     /* Industrial Metric Cards */
     .metric-card {
-        background: linear-gradient(135deg, #f7fafc 0%, #edf2f7 100%);
-        border: 2px solid #e2e8f0;
-        border-radius: 8px;
-        padding: 1.5rem;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-        transition: all 0.3s ease;
+        background: linear-gradient(135deg, #f8fafc 0%, #eef2f8 100%);
+        border: 1px solid #d4ddec;
+        border-radius: 12px;
+        padding: 1.3rem 1.5rem;
+        box-shadow: 0 10px 30px rgba(15, 23, 42, 0.12);
+        transition: box-shadow 0.25s ease, transform 0.25s ease;
     }
     
     .metric-card:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 8px 15px -3px rgba(0, 0, 0, 0.15);
-        border-color: #cbd5e0;
+        transform: translateY(-3px) scale(1.01);
+        box-shadow: 0 16px 38px rgba(15, 23, 42, 0.18);
+    }
+    
+    .metric-card-title {
+        text-transform: uppercase;
+        font-size: 0.78rem;
+        font-weight: 700;
+        letter-spacing: 0.12rem;
+        color: #475569;
+        margin-bottom: 0.55rem;
+    }
+    
+    .metric-card-value {
+        font-size: 1.95rem;
+        font-weight: 800;
+        color: #1a202c;
+        line-height: 1.1;
+    }
+    
+    .metric-card-delta {
+        font-size: 0.92rem;
+        font-weight: 600;
+        margin-top: 0.65rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08rem;
+    }
+    
+    .metric-card-delta.positive {
+        color: #16a34a;
+    }
+    
+    .metric-card-delta.negative {
+        color: #dc2626;
+    }
+    
+    .hero-card {
+        background: linear-gradient(120deg, #f9fbff 0%, #e8effd 100%);
+        border-radius: 14px;
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        padding: 1.8rem 2.1rem;
+        margin-bottom: 1.5rem;
+        box-shadow: 0 14px 40px rgba(15, 23, 42, 0.18);
+    }
+    
+    .hero-card-title {
+        font-size: 2.4rem;
+        font-weight: 900;
+        letter-spacing: 0.18rem;
+        text-transform: uppercase;
+        color: #1e293b;
+        margin: 0;
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+    }
+    
+    .hero-card-title span.icon {
+        font-size: 2.6rem;
+    }
+    
+    .hero-card-subtitle {
+        margin-top: 0.6rem;
+        font-size: 1.05rem;
+        letter-spacing: 0.12rem;
+        text-transform: uppercase;
+        color: #475569;
+        font-weight: 600;
+    }
+    
+    .hero-card-login {
+        background: linear-gradient(135deg, #f8fafc 0%, #edf2ff 100%);
     }
     
     /* Industrial Status Boxes */
@@ -267,6 +372,12 @@ if 'loaded_project' not in st.session_state:  # NEW: For loaded projects
 # Authentication functions
 def show_login_form():
     """Display login form"""
+    render_header_card(
+        title="ENERMERLION DYNAMIC EMS LOGIN",
+        subtitle="Secure industrial access",
+        icon="🔐",
+        login_style=True,
+    )
     st.markdown('<div class="auth-form">', unsafe_allow_html=True)
     st.markdown('<div class="auth-header"><h2>🔐 ENERMERLION DYNAMIC EMS LOGIN</h2></div>', unsafe_allow_html=True)
     
@@ -300,6 +411,12 @@ def show_login_form():
 
 def show_register_form():
     """Display registration form"""
+    render_header_card(
+        title="Create Industrial Account",
+        subtitle="Provision secure access to EMS simulator",
+        icon="🛠️",
+        login_style=True,
+    )
     st.markdown('<div class="auth-form">', unsafe_allow_html=True)
     st.markdown('<div class="auth-header"><h2>🚀 CREATE INDUSTRIAL ACCOUNT</h2></div>', unsafe_allow_html=True)
     
@@ -366,8 +483,11 @@ if not st.session_state.authenticated:
 # Industrial Header Section
 col1, col2, col3 = st.columns([3, 1, 1])
 with col1:
-    st.markdown('<div class="main-header">ENERMERLION DYNAMIC EMS SIMULATOR</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-header">Precision Energy Management for Industrial Applications</div>', unsafe_allow_html=True)
+    render_header_card(
+        title="ENERMERLION DYNAMIC EMS SIMULATOR",
+        subtitle="Precision Energy Management for Industrial Applications",
+        icon="⚡",
+    )
 
 with col3:
     st.markdown(f"**👤 Welcome, {st.session_state.current_user['username']}**")
@@ -661,53 +781,44 @@ if st.session_state.simulation_run and st.session_state.results is not None:
     # Industrial Metric Cards
     col1, col2, col3, col4 = st.columns(4)
     
+    md_baseline = results['analysis']['md_no_pv_no_ems']
+    md_reduction_pct = (
+        (results['analysis']['total_reduction'] / md_baseline) * 100 if md_baseline else 0
+    )
     with col1:
-        with st.container():
-            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            st.metric(
-                "MD REDUCTION", 
-                f"{results['analysis']['total_reduction']:.0f} kW",
-                delta=f"-{results['analysis']['total_reduction']/results['analysis']['md_no_pv_no_ems']*100:.1f}%"
-            )
-            st.markdown('</div>', unsafe_allow_html=True)
-    
+        render_metric_card(
+            "MD REDUCTION",
+            f"{results['analysis']['total_reduction']:.0f} kW",
+            delta=f"-{md_reduction_pct:.1f}% vs baseline",
+            delta_positive=True,
+        )
+
     with col2:
-        with st.container():
-            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            st.metric(
-                "ANNUAL SAVINGS", 
-                f"RM {results['analysis']['annual_savings']:,.0f}"
-            )
-            st.markdown('</div>', unsafe_allow_html=True)
-    
+        render_metric_card(
+            "ANNUAL SAVINGS",
+            f"RM {results['analysis']['annual_savings']:,.0f}"
+        )
+
     with col3:
-        with st.container():
-            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            st.metric(
-                "PAYBACK PERIOD", 
-                f"{results['analysis']['payback_years']:.1f} years"
-            )
-            st.markdown('</div>', unsafe_allow_html=True)
-    
+        render_metric_card(
+            "PAYBACK PERIOD",
+            f"{results['analysis']['payback_years']:.1f} years"
+        )
+
     with col4:
-        with st.container():
-            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            st.metric(
-                "10-YEAR ROI", 
-                f"{results['analysis']['roi_10yr']:.1f}%"
-            )
-            st.markdown('</div>', unsafe_allow_html=True)
-    
+        render_metric_card(
+            "10-YEAR ROI",
+            f"{results['analysis']['roi_10yr']:.1f}%"
+        )
+
     core_peak_mwh = results['analysis'].get('energy_metrics', {}).get('core_peak_discharge_mwh')
     if core_peak_mwh is not None:
         core_col, _ = st.columns([1, 3])
         with core_col:
-            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            st.metric(
+            render_metric_card(
                 "CORE PEAK SHAVING (18-22H)",
                 f"{core_peak_mwh:.2f} MWh"
             )
-            st.markdown('</div>', unsafe_allow_html=True)
     
     # System Alerts
     if 'inverter_clipping' in results['analysis']:

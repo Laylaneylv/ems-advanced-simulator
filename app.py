@@ -13,9 +13,14 @@ import io
 from datetime import datetime
 import json
 import hashlib
-import os
-import sqlite3
-from pathlib import Path
+from database import (
+    create_user as db_create_user,
+    fetch_user,
+    get_simulation_details as db_get_simulation_details,
+    get_user_simulations as db_get_user_simulations,
+    init_db,
+    save_simulation_result as db_save_simulation_result,
+)
 from ems_engine import EMSEngine
 
 # Page configuration
@@ -26,52 +31,13 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Database setup
-def init_db():
-    """Initialize SQLite database for user data"""
-    conn = sqlite3.connect('ems_users.db')
-    c = conn.cursor()
-    
-    # Users table
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            company TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_login TIMESTAMP
-        )
-    ''')
-    
-    # User sessions table
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS user_sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            session_data TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id)
-        )
-    ''')
-    
-    # Simulation results table
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS simulation_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            project_name TEXT,
-            simulation_data TEXT,
-            config_data TEXT,
-            results_data TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id)
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
+# Load environment variables if present (supports .env files)
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
 
 # Initialize database
 init_db()
@@ -83,111 +49,28 @@ def hash_password(password):
 # User authentication functions
 def create_user(username, email, password, company):
     """Create a new user account"""
-    try:
-        conn = sqlite3.connect('ems_users.db')
-        c = conn.cursor()
-        password_hash = hash_password(password)
-        c.execute(
-            'INSERT INTO users (username, email, password_hash, company) VALUES (?, ?, ?, ?)',
-            (username, email, password_hash, company)
-        )
-        conn.commit()
-        conn.close()
-        return True
-    except sqlite3.IntegrityError:
-        return False
+    password_hash = hash_password(password)
+    return db_create_user(username, email, password_hash, company)
 
 def verify_user(username, password):
     """Verify user credentials"""
-    conn = sqlite3.connect('ems_users.db')
-    c = conn.cursor()
     password_hash = hash_password(password)
-    c.execute(
-        'SELECT id, username, email, company FROM users WHERE username = ? AND password_hash = ?',
-        (username, password_hash)
-    )
-    user = c.fetchone()
-    conn.close()
-    
-    if user:
-        return {
-            'id': user[0],
-            'username': user[1],
-            'email': user[2],
-            'company': user[3]
-        }
-    return None
+    return fetch_user(username, password_hash)
+
 
 def save_simulation_result(user_id, project_name, config, results):
     """Save simulation results to database"""
-    try:
-        conn = sqlite3.connect('ems_users.db')
-        c = conn.cursor()
-        
-        # 转换DataFrame为可序列化的字典
-        serializable_results = results.copy()
-        if 'data' in serializable_results and isinstance(serializable_results['data'], pd.DataFrame):
-            serializable_results['data'] = serializable_results['data'].to_dict('records')
-        
-        c.execute(
-            '''INSERT INTO simulation_results 
-                (user_id, project_name, config_data, results_data) 
-                VALUES (?, ?, ?, ?)''',
-            (user_id, project_name, json.dumps(config), json.dumps(serializable_results, default=str))
-        )
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        st.error(f"Error saving simulation: {e}")
-        return False
+    return db_save_simulation_result(user_id, project_name, config, results)
+
 
 def get_user_simulations(user_id):
     """Get all simulations for a user"""
-    conn = sqlite3.connect('ems_users.db')
-    c = conn.cursor()
-    c.execute(
-        'SELECT id, project_name, created_at FROM simulation_results WHERE user_id = ? ORDER BY created_at DESC',
-        (user_id,)
-    )
-    simulations = c.fetchall()
-    conn.close()
-    return simulations
+    return db_get_user_simulations(user_id)
+
+
 def get_simulation_details(simulation_id):
     """Get detailed simulation data by ID"""
-    try:
-        conn = sqlite3.connect('ems_users.db')
-        c = conn.cursor()
-        c.execute(
-            'SELECT project_name, config_data, results_data FROM simulation_results WHERE id = ?',
-            (simulation_id,)
-        )
-        result = c.fetchone()
-        conn.close()
-        
-        if result:
-            project_name, config_data, results_data = result
-            
-            # 转换回DataFrame
-            config = json.loads(config_data)
-            results = json.loads(results_data)
-            
-            # 如果data是字典格式，转换回DataFrame
-            if 'data' in results and isinstance(results['data'], list):
-                results['data'] = pd.DataFrame(results['data'])
-                # 转换timestamp列回datetime
-                if 'timestamp' in results['data'].columns:
-                    results['data']['timestamp'] = pd.to_datetime(results['data']['timestamp'])
-            
-            return {
-                'project_name': project_name,
-                'config': config,
-                'results': results
-            }
-        return None
-    except Exception as e:
-        st.error(f"Error loading project: {e}")
-        return None
+    return db_get_simulation_details(simulation_id)
 # Cement & Concrete Industrial CSS
 st.markdown("""
 <style>

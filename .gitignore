@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 ems_users.db
+.env
+.env.*

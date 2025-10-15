@@ -8,3 +8,8 @@ plotly>=5.17.0
 
 # Date handling
 python-dateutil>=2.8.0
+
+# Database connectivity
+SQLAlchemy>=2.0.0
+psycopg2-binary>=2.9.0
+python-dotenv>=1.0.1

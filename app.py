@@ -377,6 +377,7 @@ if 'loaded_project' not in st.session_state:  # NEW: For loaded projects
 def show_login_form():
     """Display login form"""
     st.markdown('<div class="auth-form">', unsafe_allow_html=True)
+    st.markdown('<div class="auth-header"><h2>🔐 ENERMERLION DYNAMIC EMS LOGIN</h2></div>', unsafe_allow_html=True)
     
     with st.form("login_form"):
         username = st.text_input("👤 USERNAME", placeholder="Enter your username")
@@ -409,6 +410,7 @@ def show_login_form():
 def show_register_form():
     """Display registration form"""
     st.markdown('<div class="auth-form">', unsafe_allow_html=True)
+    st.markdown('<div class="auth-header"><h2>🚀 CREATE INDUSTRIAL ACCOUNT</h2></div>', unsafe_allow_html=True)
     
     with st.form("register_form"):
         username = st.text_input("👤 USERNAME", placeholder="Choose a username")

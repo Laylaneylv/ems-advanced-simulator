@@ -376,7 +376,6 @@ def show_login_form():
         title="ENERMERLION DYNAMIC EMS LOGIN",
         subtitle="Secure industrial access",
         icon="🔐",
-        login_style=True,
     )
     st.markdown('<div class="auth-form">', unsafe_allow_html=True)
     st.markdown('<div class="auth-header"><h2>🔐 ENERMERLION DYNAMIC EMS LOGIN</h2></div>', unsafe_allow_html=True)
@@ -805,16 +804,9 @@ if st.session_state.simulation_run and st.session_state.results is not None:
             f"{results['analysis']['payback_years']:.1f} years"
         )
 
-    with col4:
-        render_metric_card(
-            "10-YEAR ROI",
-            f"{results['analysis']['roi_10yr']:.1f}%"
-        )
-
     core_peak_mwh = results['analysis'].get('energy_metrics', {}).get('core_peak_discharge_mwh')
     if core_peak_mwh is not None:
-        core_col, _ = st.columns([1, 3])
-        with core_col:
+        with col4:
             render_metric_card(
                 "CORE PEAK SHAVING (18-22H)",
                 f"{core_peak_mwh:.2f} MWh"

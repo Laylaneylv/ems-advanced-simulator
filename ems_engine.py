@@ -132,16 +132,50 @@ class EMSEngine:
         df['net_load'] = df['load'] - df['pv_power']
         
         return df
+
+    @staticmethod
+    def _parse_decimal_hour(time_str):
+        """Convert HH:MM string to decimal hour."""
+        if not time_str:
+            return None
+        try:
+            dt = datetime.strptime(time_str, "%H:%M")
+        except ValueError:
+            return None
+        return dt.hour + dt.minute / 60
     
     def _run_ems_simulation(self, data_df):
         """Run EMS control simulation"""
         ems_config = self.config['ems_config']
+        peak_config = ems_config.get('peak_shaving_period', {})
+        peak_start_hour = peak_config.get('start_hour')
+        peak_end_hour = peak_config.get('end_hour')
+
+        if peak_start_hour is None:
+            peak_start_hour = self._parse_decimal_hour(
+                peak_config.get('start_time') or peak_config.get('start')
+            )
+        if peak_end_hour is None:
+            peak_end_hour = self._parse_decimal_hour(
+                peak_config.get('end_time') or peak_config.get('end')
+            )
+
+        peak_start_hour = peak_start_hour if peak_start_hour is not None else 18.0
+        peak_end_hour = peak_end_hour if peak_end_hour is not None else 22.0
+
+        if peak_end_hour <= peak_start_hour:
+            raise ValueError("Peak shaving end time must be later than the start time.")
+        
+        self.peak_start_hour = peak_start_hour
+        self.peak_end_hour = peak_end_hour
         
         # Initialize controller
         self.controller = AdvancedEMSController(
             target_md=ems_config['target_md'],
             max_power=ems_config['max_discharge_power'],
-            battery_capacity=ems_config['battery_capacity']
+            battery_capacity=ems_config['battery_capacity'],
+            peak_start_hour=peak_start_hour,
+            peak_end_hour=peak_end_hour
         )
         
         # Initialize results storage
@@ -259,8 +293,13 @@ class EMSEngine:
         peak_rate_mask = results_df['timestamp'].apply(
             lambda x: 14 <= x.hour < 22 and x.weekday() < 5
         )
+        peak_start = getattr(self, 'peak_start_hour', 18.0)
+        peak_end = getattr(self, 'peak_end_hour', 22.0)
         core_peak_shaving_mask = results_df['timestamp'].apply(
-            lambda x: 18 <= x.hour < 22 and x.weekday() < 5
+            lambda x: (
+                peak_start <= x.hour + x.minute / 60.0 < peak_end
+                and x.weekday() < 5
+            )
         )
         
         INTERVAL_H = 5/60

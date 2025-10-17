@@ -5,18 +5,17 @@ Penang Project EMS Control Strategy
 Control Objectives:
 1. Maximum Peak Shaving Power: 2 MW (2000 kW)
 2. Battery Capacity: 10 MWh
-3. Core Peak Period: 18:00-22:00 (4 hours) <-- CONFIRMED
-4. Strategy: Ensure 4-hour continuous peak shaving, then extend discharge post-22:00 to 15% SoE.
+3. Core Peak Period: User-defined (default 18:00-22:00 runtime configuration)
+4. Strategy: Ensure continuous peak shaving across the configured window, then extend discharge to 15% SoE.
 
 Energy Calculation:
 - Continuous 2MW discharge for 4 hours = 8 MWh (exceeds capacity)
 - Actual available: 10 MWh / 4 hours = 1.875 MW average power
 - Considering efficiency and safety margin, target average discharge = 1.8 MW
 
-Charging Strategy:
-- 6:00-14:00: PV priority to BESS, then surplus to load
-- 14:00-17:00: Under MD constraint, PV priority to BESS, then to load
-- Target: Reach 88% SoE before 18:00
+Charging Strategy (auto-adjusted to peak window):
+- Priority charging concludes a few hours before peak start to hit 88% SoE
+- Final constrained charging ends shortly before the peak window begins
 """
 
 from datetime import datetime, timedelta
@@ -29,15 +28,36 @@ class AdvancedEMSController:
     
     Core Strategy:
     1. Daytime PV priority charging to 88% SoE
-    2. 18:00-22:00 full power peak shaving (2MW or lower to extend discharge time)
-    3. Intelligent power allocation to ensure energy lasts 4 hours
-    4. Post-Peak (22:00+) extended discharge to 15% SoE.
+    2. Configurable peak window discharge (2MW or lower to extend discharge time)
+    3. Intelligent power allocation to ensure energy lasts through the peak window
+    4. Post-peak extended discharge to 15% SoE.
     """
     
-    def __init__(self, target_md=6500, max_power=2000, battery_capacity=10):
+    def __init__(
+        self,
+        target_md=6500,
+        max_power=2000,
+        battery_capacity=10,
+        peak_start_hour=18.0,
+        peak_end_hour=22.0,
+        pre_peak_buffer_hours=1.0,
+        priority_charge_duration=8.0,
+        constrained_charge_duration=3.0,
+    ):
         self.target_md = target_md
         self.max_power = max_power  # 2 MW max peak shaving power
         self.battery_capacity = battery_capacity  # 10 MWh
+
+        if peak_end_hour <= peak_start_hour:
+            raise ValueError("Peak shaving end hour must be later than the start hour.")
+        
+        # Peak configuration
+        self.peak_start_hour = peak_start_hour
+        self.peak_end_hour = peak_end_hour
+        self.pre_peak_buffer_hours = max(0.0, pre_peak_buffer_hours)
+        self.priority_charge_duration = max(0.0, priority_charge_duration)
+        self.constrained_charge_duration = max(0.0, constrained_charge_duration)
+        self.peak_duration_hours = self.peak_end_hour - self.peak_start_hour
         
         # ============ Control Parameters (considering SOH degradation) ============
         
@@ -60,24 +80,28 @@ class AdvancedEMSController:
         self.target_soe_before_peak = 88  # 88% (reserve 2% buffer)
         
         # ============ Peak Period Definition ============
-        self.peak_start_hour = 18  # 18:00 <-- CONFIRMED
-        self.peak_end_hour = 22    # 22:00 <-- CONFIRMED
-        self.peak_duration_hours = 4  # 4 hours <-- CONFIRMED
+        self.charge_end_hour = max(0.0, min(24.0, self.peak_start_hour - self.pre_peak_buffer_hours))
+        raw_priority_end = self.charge_end_hour - self.constrained_charge_duration
+        raw_priority_end = max(0.0, raw_priority_end)
+        self.priority_charge_end_hour = min(self.charge_end_hour, raw_priority_end)
+        self.charge_start_hour = max(0.0, self.priority_charge_end_hour - self.priority_charge_duration)
+        if self.charge_start_hour > self.priority_charge_end_hour:
+            self.charge_start_hour = self.priority_charge_end_hour
+        self.peak_start_minutes = self._hour_to_minutes(self.peak_start_hour)
+        self.peak_end_minutes = self._hour_to_minutes(self.peak_end_hour)
+        self.charge_start_minutes = self._hour_to_minutes(self.charge_start_hour)
+        self.priority_charge_end_minutes = self._hour_to_minutes(self.priority_charge_end_hour)
+        self.charge_end_minutes = self._hour_to_minutes(self.charge_end_hour)
         
         # Extended discharge target
         self.extended_discharge_target_soe = 15 # Continue discharge until 15% SoE
-        
-        # ============ Charging Period Definition ============
-        self.charge_start_hour = 6   # 6:00 start (PV begins generation)
-        self.priority_charge_end_hour = 14  # 14:00 (2pm) - PV absolute priority ends
-        self.charge_end_hour = 17    # 17:00 end (1 hour before Peak)
         
         # ============ Energy Management (considering SOH) ============
         
         # Actual battery capacity (considering SOH degradation)
         self.actual_capacity_mwh = self.battery_capacity * (self.current_soh / 100)
         
-        # Calculate available energy for Core Peak period (18:00-22:00)
+        # Calculate available energy for configured Core Peak period
         # We reserve the 15% SoE for the absolute end, so usable range is 88% -> 15%
         self.usable_soe_range = self.target_soe_before_peak - (self.extended_discharge_target_soe + self.soe_safety_margin)
         self.usable_energy_mwh = (self.usable_soe_range / 100) * self.actual_capacity_mwh
@@ -85,7 +109,7 @@ class AdvancedEMSController:
         # Calculate effective DOD
         self.effective_dod = self.usable_soe_range / 100
         
-        # Calculate theoretical average discharge power for CORE PEAK (18:00-22:00)
+        # Calculate theoretical average discharge power for the configured peak window
         self.theoretical_avg_discharge = (self.usable_energy_mwh / self.peak_duration_hours) * 1000  # kW
         
         # Actual control target (considering 90% roundtrip efficiency)
@@ -127,6 +151,24 @@ class AdvancedEMSController:
         # ============ Initialization Print ============
         self._print_initialization_info()
     
+    @staticmethod
+    def _hour_to_minutes(hour_decimal):
+        total_minutes = int(round(hour_decimal * 60))
+        return total_minutes % (24 * 60)
+
+    @staticmethod
+    def _format_hour(hour_decimal):
+        total_minutes = AdvancedEMSController._hour_to_minutes(hour_decimal)
+        return f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
+
+    @staticmethod
+    def _to_decimal_hour(current_time):
+        return current_time.hour + current_time.minute / 60.0
+
+    @staticmethod
+    def _minutes_since_midnight(current_time):
+        return current_time.hour * 60 + current_time.minute
+    
     def _print_initialization_info(self):
         """Print controller initialization information"""
         print("\n" + "=" * 70)
@@ -136,10 +178,25 @@ class AdvancedEMSController:
         print(f"✅ Rated Battery Capacity: {self.battery_capacity} MWh")
         print(f"✅ Current SOH: {self.current_soh}%")
         print(f"✅ Actual Available Capacity: {self.actual_capacity_mwh:.2f} MWh")
-        print(f"✅ Core Peak Period: {self.peak_start_hour}:00 - {self.peak_end_hour}:00 ({self.peak_duration_hours} hours)")
-        print(f"✅ Charging Period: {self.charge_start_hour}:00 - {self.charge_end_hour}:00")
-        print(f"   - Priority Charge: {self.charge_start_hour}:00 - {self.priority_charge_end_hour}:00")
-        print(f"   - Constrained Charge: {self.priority_charge_end_hour}:00 - {self.charge_end_hour}:00")
+        print(
+            f"✅ Core Peak Period: "
+            f"{self._format_hour(self.peak_start_hour)} - {self._format_hour(self.peak_end_hour)} "
+            f"({self.peak_duration_hours:.1f} hours)"
+        )
+        print(
+            f"✅ Charging Period: "
+            f"{self._format_hour(self.charge_start_hour)} - {self._format_hour(self.charge_end_hour)}"
+        )
+        if self.priority_charge_end_hour > self.charge_start_hour:
+            print(
+                f"   - Priority Charge: "
+                f"{self._format_hour(self.charge_start_hour)} - {self._format_hour(self.priority_charge_end_hour)}"
+            )
+        if self.charge_end_hour > self.priority_charge_end_hour:
+            print(
+                f"   - Constrained Charge: "
+                f"{self._format_hour(self.priority_charge_end_hour)} - {self._format_hour(self.charge_end_hour)}"
+            )
         print(f"\n🔋 SOH Optimization Strategy:")
         print(f"   SoE Operating Range (Max): {self.extended_discharge_target_soe}% - {self.soe_max}%")
         print(f"   Target SoE Before Peak: {self.target_soe_before_peak}%")
@@ -147,11 +204,20 @@ class AdvancedEMSController:
         print(f"   Expected Cycle Life: {self.estimated_cycles:,} cycles")
         print(f"   Expected Lifetime: {self.estimated_lifetime_years:.1f} years")
         print(f"\n💡 Extended Discharge Plan:")
-        print(f"   Post-22:00 Discharge Target: {self.extended_discharge_target_soe}% SoE")
-        print(f"\n📊 Core Peak (18:00-22:00) Energy Allocation:")
+        print(
+            f"   Post-{self._format_hour(self.peak_end_hour)} Discharge Target: "
+            f"{self.extended_discharge_target_soe}% SoE"
+        )
+        print(
+            f"\n📊 Core Peak ({self._format_hour(self.peak_start_hour)}-"
+            f"{self._format_hour(self.peak_end_hour)}) Energy Allocation:"
+        )
         print(f"   Available SoE Range: {self.extended_discharge_target_soe + self.soe_safety_margin}% → {self.target_soe_before_peak}%")
         print(f"   Usable Energy: {self.usable_energy_mwh:.2f} MWh")
-        print(f"   Target Avg Discharge: {self.target_avg_discharge:.0f} kW (for 4 hours)")
+        print(
+            f"   Target Avg Discharge: {self.target_avg_discharge:.0f} kW "
+            f"(for {self.peak_duration_hours:.1f} hours)"
+        )
         print("=" * 70)
         
     def update_soh_degradation(self, energy_discharged_mwh):
@@ -196,26 +262,26 @@ class AdvancedEMSController:
         return sum(self.window_30min) / len(self.window_30min)
     
     def is_peak_period(self, current_time):
-        """Check if in Core Peak period (18:00-22:00)"""
-        hour = current_time.hour
-        return self.peak_start_hour <= hour < self.peak_end_hour
+        """Check if within the configured peak period."""
+        current_decimal = self._to_decimal_hour(current_time)
+        return self.peak_start_hour <= current_decimal < self.peak_end_hour
     
     def is_priority_charge_period(self, current_time):
-        """Check if in priority charging period (6am-2pm)"""
-        hour = current_time.hour
-        return self.charge_start_hour <= hour < self.priority_charge_end_hour
+        """Check if in priority charging period."""
+        current_decimal = self._to_decimal_hour(current_time)
+        return self.charge_start_hour <= current_decimal < self.priority_charge_end_hour
     
     def is_constrained_charge_period(self, current_time):
-        """Check if in constrained charging period (2pm-5pm)"""
-        hour = current_time.hour
-        return self.priority_charge_end_hour <= hour < self.charge_end_hour
+        """Check if in constrained charging period."""
+        current_decimal = self._to_decimal_hour(current_time)
+        return self.priority_charge_end_hour <= current_decimal < self.charge_end_hour
     
     def get_remaining_peak_time(self, current_time):
         """Calculate remaining time in Peak period (hours)"""
         if not self.is_peak_period(current_time):
             return 0
         
-        current_decimal = current_time.hour + current_time.minute / 60.0
+        current_decimal = self._to_decimal_hour(current_time)
         remaining = self.peak_end_hour - current_decimal
         
         return max(0, remaining)
@@ -225,7 +291,7 @@ class AdvancedEMSController:
         if not self.is_peak_period(current_time):
             return 0
         
-        current_decimal = current_time.hour + current_time.minute / 60.0
+        current_decimal = self._to_decimal_hour(current_time)
         elapsed = current_decimal - self.peak_start_hour
         
         return max(0, elapsed)
@@ -286,11 +352,7 @@ class AdvancedEMSController:
         return discharge
     
     def calculate_charge_power_priority(self, current_time, soe, load, pv_power):
-        """
-        Calculate charging power - Priority Period (6am-2pm)
-        
-        Strategy: PV priority to BESS charging
-        """
+        """Calculate charging power during priority charging window (PV-priority)."""
         # Already reached target SoE
         if soe >= self.target_soe_before_peak:
             return 0
@@ -303,8 +365,8 @@ class AdvancedEMSController:
         soe_deficit = self.target_soe_before_peak - soe
         required_energy_mwh = (soe_deficit / 100) * self.battery_capacity
         
-        # Calculate remaining charging time (until 17:00)
-        current_decimal = current_time.hour + current_time.minute / 60.0
+        # Calculate remaining charging time (until configured cut-off)
+        current_decimal = self._to_decimal_hour(current_time)
         remaining_charge_time = self.charge_end_hour - current_decimal
         
         if remaining_charge_time <= 0:
@@ -335,11 +397,7 @@ class AdvancedEMSController:
         return charge_power
     
     def calculate_charge_power_constrained(self, current_time, soe, load, pv_power):
-        """
-        Calculate charging power - Constrained Period (2pm-5pm)
-        
-        Strategy: MD-aware charging
-        """
+        """Calculate charging power during constrained charging window (MD-aware)."""
         # Already reached target SoE
         if soe >= self.target_soe_before_peak:
             return 0
@@ -363,7 +421,7 @@ class AdvancedEMSController:
         required_energy_mwh = (soe_deficit / 100) * self.battery_capacity
         
         # Calculate remaining charging time
-        current_decimal = current_time.hour + current_time.minute / 60.0
+        current_decimal = self._to_decimal_hour(current_time)
         remaining_charge_time = self.charge_end_hour - current_decimal
         
         if remaining_charge_time <= 0:
@@ -411,10 +469,11 @@ class AdvancedEMSController:
         if pv_power is not None:
             self.pv_history.append(pv_power)
         
-        hour = current_time.hour
+        current_decimal = self._to_decimal_hour(current_time)
+        current_minutes = self._minutes_since_midnight(current_time)
         minute = current_time.minute
         
-        # ============ Phase 1: Priority Charging Period (6:00-14:00) ============
+        # ============ Phase 1: Priority Charging Period (PV-priority) ============
         if self.is_priority_charge_period(current_time):
             if load is not None and pv_power is not None:
                 charge_power = self.calculate_charge_power_priority(current_time, soe, load, pv_power)
@@ -422,10 +481,10 @@ class AdvancedEMSController:
                     return -charge_power  # Negative = charging
             return 0
         
-        # ============ Phase 2: Constrained Charging Period (14:00-17:00) ============
+        # ============ Phase 2: Constrained Charging Period (MD-aware) ============
         elif self.is_constrained_charge_period(current_time):
             # Pre-Peak check at 17:00
-            if hour == 17 and minute == 0:
+            if current_minutes == self.charge_end_minutes:
                 if soe < self.target_soe_before_peak:
                     shortage = self.target_soe_before_peak - soe
                     print(f"⚠️  {current_time.strftime('%H:%M')} Pre-Peak Check: SoE={soe:.1f}% (Short by {shortage:.1f}%)")
@@ -438,18 +497,22 @@ class AdvancedEMSController:
                     return -charge_power  # Negative = charging
             return 0
         
-        # ============ Phase 3: Pre-Peak Standby (17:00-18:00) ============
-        elif 17 <= hour < self.peak_start_hour:
+        # ============ Phase 3: Pre-Peak Standby (buffer before peak) ============
+        elif self.charge_end_hour <= current_decimal < self.peak_start_hour:
             # No charging or discharging, wait for Core Peak period
             return 0
         
-        # ============ Phase 4: Core Peak Shaving Period (18:00-22:00) ============
+        # ============ Phase 4: Core Peak Shaving Period ============
         elif self.is_peak_period(current_time):
             # Record SoE at Peak start
-            if self.peak_start_soe is None or (hour == self.peak_start_hour and minute == 0):
+            if self.peak_start_soe is None or current_minutes == self.peak_start_minutes:
                 self.peak_start_soe = soe
                 print(f"\n{'='*70}")
-                print(f"🔥 Core Peak Shaving Starts (18:00-22:00) | Starting SoE: {soe:.1f}%")
+                print(
+                    f"🔥 Core Peak Shaving Starts "
+                    f"({self._format_hour(self.peak_start_hour)}-{self._format_hour(self.peak_end_hour)}) "
+                    f"| Starting SoE: {soe:.1f}%"
+                )
                 print(f"{'='*70}")
             
             # SoE safety check: Use energy down to the extended discharge target + safety
@@ -462,12 +525,12 @@ class AdvancedEMSController:
             
             return discharge
         
-        # ============ Phase 5: Extended Discharge Period (22:00-24:00, 0:00-6:00) ============
-        # Goal: Continue discharge until 15% SoE is hit
-        elif hour >= self.peak_end_hour or hour < self.charge_start_hour: # 22:00-23:59 or 00:00-05:59
+        # ============ Phase 5: Extended Discharge Period ============
+        # Goal: Continue discharge until 15% SoE is hit or charging window resumes
+        elif current_decimal >= self.peak_end_hour or current_decimal < self.charge_start_hour:
             
             # Peak end report and reset (22:00:00)
-            if hour == self.peak_end_hour and minute == 0 and self.peak_start_soe is not None:
+            if current_minutes == self.peak_end_minutes and self.peak_start_soe is not None:
                 # Calculate energy used during Core Peak
                 total_discharged = (self.peak_start_soe - soe) / 100 * self.battery_capacity
                 print(f"\n{'='*70}")
@@ -513,7 +576,11 @@ if __name__ == "__main__":
     )
     
     print("\n" + "=" * 70)
-    print("🧪 Controller Test (18:00-22:00 Core Peak, then Extended)")
+    print(
+        f"🧪 Controller Test "
+        f"({controller._format_hour(controller.peak_start_hour)}-"
+        f"{controller._format_hour(controller.peak_end_hour)} Core Peak, then Extended)"
+    )
     print("=" * 70)
     
     # Simulate Peak period

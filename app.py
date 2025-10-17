@@ -10,7 +10,7 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import io
-from datetime import datetime
+from datetime import datetime, time
 import json
 import hashlib
 from database import (
@@ -50,6 +50,276 @@ def _format_simulation_date(value):
         return value.strftime("%Y-%m-%d")
     except AttributeError:
         return str(value)
+
+
+def _parse_time_value(value: str | None, fallback: time) -> time:
+    """Parse HH:MM string into time; return fallback on failure."""
+    if not value:
+        return fallback
+    try:
+        return datetime.strptime(value, "%H:%M").time()
+    except ValueError:
+        return fallback
+
+
+# --- Currency handling helpers ------------------------------------------------
+CURRENCY_PRESETS = [
+    {
+        "aliases": {"malaysia", "my", "myr", "malaysian"},
+        "code": "MYR",
+        "symbol": "RM",
+        "name": "Malaysian Ringgit",
+        "rate_to_myr": 1.0,
+    },
+    {
+        "aliases": {"singapore", "sg", "sgp"},
+        "code": "SGD",
+        "symbol": "S$",
+        "name": "Singapore Dollar",
+        "rate_to_myr": 3.45,
+    },
+    {
+        "aliases": {"united states", "usa", "us", "america", "american"},
+        "code": "USD",
+        "symbol": "$",
+        "name": "US Dollar",
+        "rate_to_myr": 4.70,
+    },
+    {
+        "aliases": {"euro", "europe", "germany", "france", "italy", "spain", "netherlands"},
+        "code": "EUR",
+        "symbol": "€",
+        "name": "Euro",
+        "rate_to_myr": 5.10,
+    },
+    {
+        "aliases": {"united kingdom", "uk", "britain", "england", "great britain"},
+        "code": "GBP",
+        "symbol": "£",
+        "name": "British Pound",
+        "rate_to_myr": 6.00,
+    },
+    {
+        "aliases": {"australia", "au", "aus"},
+        "code": "AUD",
+        "symbol": "A$",
+        "name": "Australian Dollar",
+        "rate_to_myr": 3.10,
+    },
+    {
+        "aliases": {"china", "cn", "prc", "chinese"},
+        "code": "CNY",
+        "symbol": "¥",
+        "name": "Chinese Yuan",
+        "rate_to_myr": 0.65,
+    },
+    {
+        "aliases": {"japan", "jp", "japanese"},
+        "code": "JPY",
+        "symbol": "¥",
+        "name": "Japanese Yen",
+        "rate_to_myr": 0.032,
+    },
+    {
+        "aliases": {"south korea", "korea", "kr"},
+        "code": "KRW",
+        "symbol": "₩",
+        "name": "South Korean Won",
+        "rate_to_myr": 0.0035,
+    },
+    {
+        "aliases": {"india", "in", "indian"},
+        "code": "INR",
+        "symbol": "₹",
+        "name": "Indian Rupee",
+        "rate_to_myr": 0.056,
+    },
+    {
+        "aliases": {"indonesia", "id", "indo"},
+        "code": "IDR",
+        "symbol": "Rp",
+        "name": "Indonesian Rupiah",
+        "rate_to_myr": 0.00032,
+    },
+    {
+        "aliases": {"thailand", "th", "thai"},
+        "code": "THB",
+        "symbol": "฿",
+        "name": "Thai Baht",
+        "rate_to_myr": 0.13,
+    },
+    {
+        "aliases": {"vietnam", "vn", "viet"},
+        "code": "VND",
+        "symbol": "₫",
+        "name": "Vietnamese Dong",
+        "rate_to_myr": 0.00020,
+    },
+    {
+        "aliases": {"philippines", "ph", "philippine"},
+        "code": "PHP",
+        "symbol": "₱",
+        "name": "Philippine Peso",
+        "rate_to_myr": 0.085,
+    },
+]
+
+DEFAULT_CURRENCY_PROFILE = CURRENCY_PRESETS[0]
+
+FINANCIAL_FIELD_DEFAULTS_MYR = {
+    "capex": 4_861_625.0,
+    "md_charge": 97.0,
+    "peak_rate": 0.31,
+    "offpeak_rate": 0.27,
+}
+
+FINANCIAL_FIELD_STEPS_MYR = {
+    "capex": 10_000.0,
+    "md_charge": 0.001,
+    "peak_rate": 0.001,
+    "offpeak_rate": 0.001,
+}
+
+FINANCIAL_FIELD_FORMATS = {
+    "capex": "%.0f",
+    "md_charge": "%.3f",
+    "peak_rate": "%.3f",
+    "offpeak_rate": "%.3f",
+}
+
+FINANCIAL_CONFIG_KEYS = {
+    "capex": "capex",
+    "md_charge": "md_charge",
+    "peak_rate": "peak_energy_rate",
+    "offpeak_rate": "offpeak_energy_rate",
+}
+
+
+def _normalize_country(value: str | None) -> str:
+    if not value:
+        return ""
+    return value.strip().lower()
+
+
+def _format_hour_label(value) -> str:
+    """Format hour value (string HH:MM or decimal) into HH:MM."""
+    if isinstance(value, str) and ":" in value:
+        return value
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "00:00"
+    hour = int(numeric) % 24
+    minute = int(round((numeric - hour) * 60)) % 60
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _resolve_currency_profile(country: str | None, *, preferred_code: str | None = None) -> dict:
+    """Resolve a currency profile from country name or preferred ISO code."""
+    if preferred_code:
+        for profile in CURRENCY_PRESETS:
+            if profile["code"] == preferred_code:
+                return profile
+    normalized = _normalize_country(country)
+    if not normalized:
+        return DEFAULT_CURRENCY_PROFILE
+    for profile in CURRENCY_PRESETS:
+        if normalized in profile["aliases"]:
+            return profile
+    for profile in CURRENCY_PRESETS:
+        if any(alias in normalized for alias in profile["aliases"]):
+            return profile
+    return DEFAULT_CURRENCY_PROFILE
+
+
+def _with_override_rate(profile: dict, rate_to_myr: float | None) -> dict:
+    """Return a copy of the profile with an overridden exchange rate if provided."""
+    if rate_to_myr is None:
+        return profile
+    new_profile = profile.copy()
+    new_profile["rate_to_myr"] = rate_to_myr
+    return new_profile
+
+
+def _convert_from_myr(amount_myr: float, profile: dict) -> float:
+    """Convert MYR amount to the target currency."""
+    if profile["rate_to_myr"] == 0:
+        return amount_myr
+    return amount_myr / profile["rate_to_myr"]
+
+
+def _convert_to_myr(amount: float, profile: dict) -> float:
+    """Convert amount in target currency back to MYR."""
+    return amount * profile["rate_to_myr"]
+
+
+def _format_currency(amount: float, profile: dict, *, decimals: int = 0) -> str:
+    """Format currency values with symbol and grouping."""
+    format_spec = f",.{decimals}f"
+    return f"{profile['symbol']} {format(amount, format_spec)}"
+
+
+def _ensure_financial_state(currency_profile: dict):
+    """Initialize or update financial values stored in session state."""
+    if "financial_base_myr" not in st.session_state:
+        st.session_state.financial_base_myr = FINANCIAL_FIELD_DEFAULTS_MYR.copy()
+    if "financial_inputs" not in st.session_state:
+        st.session_state.financial_inputs = {
+            key: _convert_from_myr(value, currency_profile)
+            for key, value in st.session_state.financial_base_myr.items()
+        }
+    if "financial_currency_code" not in st.session_state:
+        st.session_state.financial_currency_code = currency_profile["code"]
+    # ensure widget keys exist
+    for key, value in st.session_state.financial_inputs.items():
+        widget_key = f"{key}_input"
+        if widget_key not in st.session_state:
+            st.session_state[widget_key] = value
+
+
+def _compute_step(field_key: str, profile: dict) -> float:
+    """Get a numeric step size scaled to the active currency."""
+    base_step = FINANCIAL_FIELD_STEPS_MYR[field_key]
+    step = _convert_from_myr(base_step, profile)
+    # Avoid zero or extremely small step sizes
+    min_step = 10 ** -4
+    if step <= 0:
+        return min_step
+    return max(step, min_step)
+
+
+def _apply_loaded_financial_config(financial_config: dict):
+    """Update financial session state using values from a loaded project."""
+    if not financial_config:
+        return
+    preferred_code = financial_config.get("currency_code")
+    profile = _resolve_currency_profile(financial_config.get("currency_name"), preferred_code=preferred_code)
+    profile = _with_override_rate(profile, financial_config.get("exchange_rate_to_myr"))
+    # Ensure state containers exist
+    _ensure_financial_state(profile)
+    for field_key, config_key in FINANCIAL_CONFIG_KEYS.items():
+        value_local = financial_config.get(config_key)
+        if value_local is None:
+            continue
+        base_myr = _convert_to_myr(value_local, profile)
+        st.session_state.financial_base_myr[field_key] = base_myr
+    # Refresh widget values in the loaded currency
+    for field_key, base_value in st.session_state.financial_base_myr.items():
+        display_value = _convert_from_myr(base_value, profile)
+        st.session_state.financial_inputs[field_key] = display_value
+        st.session_state[f"{field_key}_input"] = display_value
+    st.session_state.financial_currency_code = profile["code"]
+    st.session_state.currency_profile = profile
+
+
+def _get_active_currency_profile() -> dict:
+    """Get the currency profile associated with the current or last simulation."""
+    config = st.session_state.get("last_run_config")
+    if config:
+        financial = config.get("financial", {})
+        profile = _resolve_currency_profile(financial.get("currency_name"), preferred_code=financial.get("currency_code"))
+        return _with_override_rate(profile, financial.get("exchange_rate_to_myr"))
+    return st.session_state.get("currency_profile", DEFAULT_CURRENCY_PROFILE)
 
 
 def render_header_card(title: str, subtitle: str | None = None, icon: str | None = None, *, login_style: bool = False) -> None:
@@ -372,6 +642,10 @@ if 'show_register' not in st.session_state:
     st.session_state.show_register = False
 if 'loaded_project' not in st.session_state:  # NEW: For loaded projects
     st.session_state.loaded_project = None
+if 'last_run_config' not in st.session_state:
+    st.session_state.last_run_config = None
+if 'currency_profile' not in st.session_state:
+    st.session_state.currency_profile = DEFAULT_CURRENCY_PROFILE
 
 # Authentication functions
 def show_login_form():
@@ -497,9 +771,27 @@ with st.sidebar:
         project_name = st.text_input("PROJECT NAME", value=f"Project_{datetime.now().strftime('%Y%m%d_%H%M')}")
         col1, col2 = st.columns(2)
         with col1:
-            country = st.text_input("Country", value="Malaysia")
+            country = st.text_input("Country", value="Malaysia", key="country_input")
         with col2:
-            city = st.text_input("City", value="Penang")
+            city = st.text_input("City", value="Penang", key="city_input")
+
+    previous_currency_code = st.session_state.get("financial_currency_code")
+    resolved_profile = _resolve_currency_profile(country)
+    if (
+        previous_currency_code
+        and resolved_profile["code"] == DEFAULT_CURRENCY_PROFILE["code"]
+        and _normalize_country(country) not in DEFAULT_CURRENCY_PROFILE["aliases"]
+    ):
+        # Unrecognized country: keep previous currency selection
+        resolved_profile = _resolve_currency_profile(None, preferred_code=previous_currency_code)
+    _ensure_financial_state(resolved_profile)
+    if st.session_state.financial_currency_code != resolved_profile["code"]:
+        for field_key, base_value in st.session_state.financial_base_myr.items():
+            updated_value = _convert_from_myr(base_value, resolved_profile)
+            st.session_state.financial_inputs[field_key] = updated_value
+            st.session_state[f"{field_key}_input"] = updated_value
+        st.session_state.financial_currency_code = resolved_profile["code"]
+    st.session_state.currency_profile = resolved_profile
     
     # Data Upload Section
     with st.expander("📊 LOAD DATA UPLOAD", expanded=True):
@@ -582,45 +874,92 @@ with st.sidebar:
     
     # Target Settings
     with st.expander("🎯 CONTROL STRATEGY", expanded=True):
+        default_peak_start = time(18, 0)
+        default_peak_end = time(22, 0)
+
+        if st.session_state.loaded_project:
+            project_peak_config = st.session_state.loaded_project['config']['ems_config'].get('peak_shaving_period', {})
+            peak_start_prefill = _parse_time_value(
+                project_peak_config.get('start_time') or project_peak_config.get('start'),
+                default_peak_start
+            )
+            peak_end_prefill = _parse_time_value(
+                project_peak_config.get('end_time') or project_peak_config.get('end'),
+                default_peak_end
+            )
+        else:
+            peak_start_prefill = default_peak_start
+            peak_end_prefill = default_peak_end
+
+        peak_start_time = st.time_input(
+            "BESS PEAK SHAVING START",
+            value=peak_start_prefill,
+            help="Define when the battery begins peak shaving (default 18:00)."
+        )
+        peak_end_time = st.time_input(
+            "BESS PEAK SHAVING END",
+            value=peak_end_prefill,
+            help="Define when the battery stops peak shaving (default 22:00)."
+        )
+
+        if peak_end_time <= peak_start_time:
+            st.error("⚠️ Peak shaving end time must be later than the start time.")
+
         target_md = st.number_input(
             "TARGET MD (KW)", 
             min_value=0.0, 
             value=6500.0, 
             step=100.0
         )
+
+    peak_start_decimal = peak_start_time.hour + peak_start_time.minute / 60
+    peak_end_decimal = peak_end_time.hour + peak_end_time.minute / 60
+    peak_period_valid = peak_end_decimal > peak_start_decimal
     
     # Financial Parameters
     with st.expander("💰 FINANCIAL PARAMETERS", expanded=True):
+        currency_label = f"{resolved_profile['symbol']} ({resolved_profile['code']})"
         capex = st.number_input(
-            "TOTAL CAPEX (RM)", 
+            f"TOTAL CAPEX ({currency_label})", 
             min_value=0.0, 
-            value=4861625.0, 
-            step=10000.0,
-            format="%.0f"
+            step=_compute_step("capex", resolved_profile),
+            format=FINANCIAL_FIELD_FORMATS["capex"],
+            key="capex_input"
         )
+        st.session_state.financial_inputs["capex"] = capex
+        st.session_state.financial_base_myr["capex"] = _convert_to_myr(capex, resolved_profile)
         
         col1, col2 = st.columns(2)
         with col1:
             md_charge = st.number_input(
-                "MD CHARGE (RM/KW)", 
+                f"MD CHARGE ({currency_label}/KW)", 
                 min_value=0.0, 
-                value=97.0, 
-                step=1.0
+                step=_compute_step("md_charge", resolved_profile),
+                format=FINANCIAL_FIELD_FORMATS["md_charge"],
+                key="md_charge_input"
             )
+            st.session_state.financial_inputs["md_charge"] = md_charge
+            st.session_state.financial_base_myr["md_charge"] = _convert_to_myr(md_charge, resolved_profile)
         with col2:
             peak_rate = st.number_input(
-                "PEAK RATE (RM/KWH)", 
+                f"PEAK RATE ({currency_label}/KWH)", 
                 min_value=0.0, 
-                value=0.31, 
-                step=0.01
+                step=_compute_step("peak_rate", resolved_profile),
+                format=FINANCIAL_FIELD_FORMATS["peak_rate"],
+                key="peak_rate_input"
             )
+            st.session_state.financial_inputs["peak_rate"] = peak_rate
+            st.session_state.financial_base_myr["peak_rate"] = _convert_to_myr(peak_rate, resolved_profile)
         
         offpeak_rate = st.number_input(
-            "OFF-PEAK RATE (RM/KWH)", 
+            f"OFF-PEAK RATE ({currency_label}/KWH)", 
             min_value=0.0, 
-            value=0.27, 
-            step=0.01
+            step=_compute_step("offpeak_rate", resolved_profile),
+            format=FINANCIAL_FIELD_FORMATS["offpeak_rate"],
+            key="offpeak_rate_input"
         )
+        st.session_state.financial_inputs["offpeak_rate"] = offpeak_rate
+        st.session_state.financial_base_myr["offpeak_rate"] = _convert_to_myr(offpeak_rate, resolved_profile)
         
         # NEW: PV Savings Inclusion Option
         st.markdown("#### 📊 ROI CALCULATION OPTIONS")
@@ -660,10 +999,26 @@ with st.sidebar:
                 # 加载项目数据
                 project_data = get_simulation_details(selected_sim_id)
                 if project_data:
+                    financial_cfg = project_data['config'].get('financial', {})
+                    _apply_loaded_financial_config(financial_cfg)
+                    location_cfg = project_data['config'].get('location', {})
+                    loaded_country = location_cfg.get('country')
+                    loaded_city = location_cfg.get('city')
+                    if not loaded_country and isinstance(location_cfg.get('name'), str):
+                        parts = [p.strip() for p in location_cfg['name'].split(",") if p.strip()]
+                        if parts:
+                            loaded_country = parts[-1]
+                        if len(parts) > 1:
+                            loaded_city = parts[0]
+                    if loaded_country:
+                        st.session_state.country_input = loaded_country
+                    if loaded_city:
+                        st.session_state.city_input = loaded_city
                     st.session_state.loaded_project = project_data
                     st.session_state.simulation_run = True
                     st.session_state.results = project_data['results']
                     st.session_state.include_pv_savings = project_data['config']['financial'].get('include_pv_savings', True)
+                    st.session_state.last_run_config = project_data['config']
                     st.success(f"✅ Project '{project_data['project_name']}' loaded successfully!")
                     st.rerun()
                 else:
@@ -675,10 +1030,26 @@ with st.sidebar:
                     if st.button(f"📁 {display_name}", key=f"load_{sim_id}", use_container_width=True):
                         project_data = get_simulation_details(sim_id)
                         if project_data:
+                            financial_cfg = project_data['config'].get('financial', {})
+                            _apply_loaded_financial_config(financial_cfg)
+                            location_cfg = project_data['config'].get('location', {})
+                            loaded_country = location_cfg.get('country')
+                            loaded_city = location_cfg.get('city')
+                            if not loaded_country and isinstance(location_cfg.get('name'), str):
+                                parts = [p.strip() for p in location_cfg['name'].split(",") if p.strip()]
+                                if parts:
+                                    loaded_country = parts[-1]
+                                if len(parts) > 1:
+                                    loaded_city = parts[0]
+                            if loaded_country:
+                                st.session_state.country_input = loaded_country
+                            if loaded_city:
+                                st.session_state.city_input = loaded_city
                             st.session_state.loaded_project = project_data
                             st.session_state.simulation_run = True
                             st.session_state.results = project_data['results']
                             st.session_state.include_pv_savings = project_data['config']['financial'].get('include_pv_savings', True)
+                            st.session_state.last_run_config = project_data['config']
                             st.success(f"✅ Project '{project_data['project_name']}' loaded!")
                             st.rerun()
         else:
@@ -697,51 +1068,70 @@ if load_df is not None:
         )
     
     if run_button:
-        with st.spinner("🔄 RUNNING INDUSTRIAL SIMULATION..."):
-            try:
-                config = {
-                    'location': {'name': f"{city}, {country}"},
-                    'pv_system': {
-                        'total_capacity_kwp': pv_capacity,
-                        'system_loss': system_loss,
-                        'inverter_capacity_kw': inverter_capacity
-                    },
-                    'ems_config': {
-                        'target_md': target_md,
-                        'max_discharge_power': max_discharge,
-                        'battery_capacity': battery_capacity,
-                        'initial_soe': 60
-                    },
-                    'financial': {
-                        'capex': capex,
-                        'md_charge': md_charge,
-                        'peak_energy_rate': peak_rate,
-                        'offpeak_energy_rate': offpeak_rate,
-                        'include_pv_savings': st.session_state.include_pv_savings  # NEW: Pass the option to engine
+        if not peak_period_valid:
+            st.error("❌ Please ensure the peak shaving end time is later than the start time before running the simulation.")
+        else:
+            with st.spinner("🔄 RUNNING INDUSTRIAL SIMULATION..."):
+                try:
+                    config = {
+                        'location': {
+                            'name': f"{city}, {country}",
+                            'city': city,
+                            'country': country
+                        },
+                        'pv_system': {
+                            'total_capacity_kwp': pv_capacity,
+                            'system_loss': system_loss,
+                            'inverter_capacity_kw': inverter_capacity
+                        },
+                        'ems_config': {
+                            'target_md': target_md,
+                            'max_discharge_power': max_discharge,
+                            'battery_capacity': battery_capacity,
+                            'initial_soe': 60,
+                            'peak_shaving_period': {
+                                'start_time': peak_start_time.strftime("%H:%M"),
+                                'end_time': peak_end_time.strftime("%H:%M"),
+                                'start_hour': peak_start_decimal,
+                                'end_hour': peak_end_decimal
+                            }
+                        },
+                        'financial': {
+                            'capex': capex,
+                            'md_charge': md_charge,
+                            'peak_energy_rate': peak_rate,
+                            'offpeak_energy_rate': offpeak_rate,
+                            'include_pv_savings': st.session_state.include_pv_savings,  # NEW: Pass the option to engine
+                            'currency_code': resolved_profile['code'],
+                            'currency_symbol': resolved_profile['symbol'],
+                            'currency_name': resolved_profile['name'],
+                            'exchange_rate_to_myr': resolved_profile['rate_to_myr'],
+                            'base_currency': 'MYR'
+                        }
                     }
-                }
+                    
+                    engine = EMSEngine(config)
+                    results = engine.run_simulation(load_df)
+                    
+                    # Save simulation results to database
+                    save_success = save_simulation_result(
+                        st.session_state.current_user['id'],
+                        project_name,
+                        config,
+                        results
+                    )
+                    
+                    st.session_state.simulation_run = True
+                    st.session_state.results = results
+                    st.session_state.last_run_config = config
+                    
+                    if save_success:
+                        st.success("✅ SIMULATION COMPLETED & SAVED")
+                    else:
+                        st.success("✅ SIMULATION COMPLETED")
                 
-                engine = EMSEngine(config)
-                results = engine.run_simulation(load_df)
-                
-                # Save simulation results to database
-                save_success = save_simulation_result(
-                    st.session_state.current_user['id'],
-                    project_name,
-                    config,
-                    results
-                )
-                
-                st.session_state.simulation_run = True
-                st.session_state.results = results
-                
-                if save_success:
-                    st.success("✅ SIMULATION COMPLETED & SAVED")
-                else:
-                    st.success("✅ SIMULATION COMPLETED")
-                
-            except Exception as e:
-                st.error(f"❌ SIMULATION ERROR: {e}")
+                except Exception as e:
+                    st.error(f"❌ SIMULATION ERROR: {e}")
 
 # Display Results - Industrial Style
 if st.session_state.simulation_run and st.session_state.results is not None:
@@ -770,6 +1160,16 @@ if st.session_state.simulation_run and st.session_state.results is not None:
     </div>
     """, unsafe_allow_html=True)
     
+    currency_profile_display = _get_active_currency_profile()
+    currency_label = f"{currency_profile_display['symbol']} ({currency_profile_display['code']})"
+    annual_savings_display = _format_currency(results['analysis']['annual_savings'], currency_profile_display)
+    peak_period_cfg = (st.session_state.last_run_config or {}).get('ems_config', {}).get('peak_shaving_period', {})
+    peak_start_label = _format_hour_label(peak_period_cfg.get('start_time') or peak_period_cfg.get('start_hour'))
+    peak_end_label = _format_hour_label(peak_period_cfg.get('end_time') or peak_period_cfg.get('end_hour'))
+    peak_window_label = f"{peak_start_label}-{peak_end_label}"
+    if peak_window_label == "00:00-00:00":
+        peak_window_label = "18:00-22:00"
+    
     # Industrial Metric Cards
     col1, col2, col3, col4 = st.columns(4)
     
@@ -788,7 +1188,7 @@ if st.session_state.simulation_run and st.session_state.results is not None:
     with col2:
         render_metric_card(
             "ANNUAL SAVINGS",
-            f"RM {results['analysis']['annual_savings']:,.0f}"
+            annual_savings_display
         )
 
     with col3:
@@ -801,7 +1201,7 @@ if st.session_state.simulation_run and st.session_state.results is not None:
     if core_peak_mwh is not None:
         with col4:
             render_metric_card(
-                "CORE PEAK SHAVING (18-22H)",
+                f"CORE PEAK SHAVING ({peak_window_label})",
                 f"{core_peak_mwh:.2f} MWh"
             )
     
@@ -1036,7 +1436,8 @@ if st.session_state.simulation_run and st.session_state.results is not None:
         with col2:
             st.markdown("##### 📈 PAYBACK ANALYSIS")
             years = np.arange(0, 11)
-            cumulative = [results['analysis']['annual_savings'] * y - capex for y in years]
+            capex_value = results['analysis'].get('capex', 0)
+            cumulative = [results['analysis']['annual_savings'] * y - capex_value for y in years]
             
             payback_fig = go.Figure()
             payback_fig.add_trace(go.Scatter(
@@ -1052,7 +1453,7 @@ if st.session_state.simulation_run and st.session_state.results is not None:
             )
             payback_fig.update_layout(
                 xaxis_title="YEARS", 
-                yaxis_title="CUMULATIVE CASH FLOW (RM)", 
+                yaxis_title=f"CUMULATIVE CASH FLOW ({currency_label})", 
                 height=600,
                 title="PROJECT PAYBACK TIMELINE",
                 plot_bgcolor='white',
@@ -1066,13 +1467,13 @@ if st.session_state.simulation_run and st.session_state.results is not None:
         
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("MD CHARGE SAVINGS", f"RM {breakdown['md_savings']:,.0f}")
+            st.metric("MD CHARGE SAVINGS", _format_currency(breakdown['md_savings'], currency_profile_display))
         with col2:
-            st.metric("PEAK ENERGY SAVINGS", f"RM {breakdown['peak_discharge_savings']:,.0f}")
+            st.metric("PEAK ENERGY SAVINGS", _format_currency(breakdown['peak_discharge_savings'], currency_profile_display))
         with col3:
-            st.metric("OFF-PEAK SAVINGS", f"RM {breakdown['offpeak_discharge_savings']:,.0f}")
+            st.metric("OFF-PEAK SAVINGS", _format_currency(breakdown['offpeak_discharge_savings'], currency_profile_display))
         with col4:
-            st.metric("PV SELF-CONSUMPTION", f"RM {breakdown['pv_self_consumption_savings']:,.0f}")
+            st.metric("PV SELF-CONSUMPTION", _format_currency(breakdown['pv_self_consumption_savings'], currency_profile_display))
         
         # Display PV Savings Inclusion Note
         if not st.session_state.include_pv_savings:
@@ -1080,7 +1481,7 @@ if st.session_state.simulation_run and st.session_state.results is not None:
             <div class="warning-box">
                 <h4>📊 NOTE: PV SAVINGS EXCLUDED</h4>
                 <p>PV energy savings are currently excluded from ROI calculations. This analysis shows BESS-only financial performance.</p>
-                <p><strong>PV Self-Consumption Savings:</strong> RM {breakdown['pv_self_consumption_savings']:,.0f} (excluded from totals)</p>
+                <p><strong>PV Self-Consumption Savings:</strong> {_format_currency(breakdown['pv_self_consumption_savings'], currency_profile_display)} (excluded from totals)</p>
             </div>
             """, unsafe_allow_html=True)
     
@@ -1096,7 +1497,7 @@ if st.session_state.simulation_run and st.session_state.results is not None:
                 <p><strong>Current Utilization:</strong> {100-rec['utilization_rate']:.1f}% of BESS capacity</p>
                 <p><strong>Remaining Capacity:</strong> {rec['remaining_capacity']:.0f} kW available</p>
                 <p><strong>Recommended Target:</strong> {rec['suggested_target']:.0f} kW</p>
-                <p><strong>Additional Annual Savings:</strong> RM {rec['extra_annual_savings']:,.0f}</p>
+                <p><strong>Additional Annual Savings:</strong> {_format_currency(rec['extra_annual_savings'], currency_profile_display)}</p>
             </div>
             """, unsafe_allow_html=True)
         else:

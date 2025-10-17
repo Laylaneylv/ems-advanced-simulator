@@ -646,6 +646,8 @@ if 'last_run_config' not in st.session_state:
     st.session_state.last_run_config = None
 if 'currency_profile' not in st.session_state:
     st.session_state.currency_profile = DEFAULT_CURRENCY_PROFILE
+if 'initial_soe_input' not in st.session_state:
+    st.session_state.initial_soe_input = 60.0
 
 # Authentication functions
 def show_login_form():
@@ -871,6 +873,14 @@ with st.sidebar:
                 value=2000.0, 
                 step=100.0
             )
+        
+        initial_soe = st.number_input(
+            "INITIAL SOE (%)",
+            min_value=0.0,
+            max_value=100.0,
+            step=1.0,
+            key="initial_soe_input"
+        )
     
     # Target Settings
     with st.expander("🎯 CONTROL STRATEGY", expanded=True):
@@ -1014,6 +1024,9 @@ with st.sidebar:
                         st.session_state.country_input = loaded_country
                     if loaded_city:
                         st.session_state.city_input = loaded_city
+                    initial_soe_loaded = project_data['config']['ems_config'].get('initial_soe')
+                    if initial_soe_loaded is not None:
+                        st.session_state.initial_soe_input = float(initial_soe_loaded)
                     st.session_state.loaded_project = project_data
                     st.session_state.simulation_run = True
                     st.session_state.results = project_data['results']
@@ -1045,6 +1058,9 @@ with st.sidebar:
                                 st.session_state.country_input = loaded_country
                             if loaded_city:
                                 st.session_state.city_input = loaded_city
+                            initial_soe_loaded = project_data['config']['ems_config'].get('initial_soe')
+                            if initial_soe_loaded is not None:
+                                st.session_state.initial_soe_input = float(initial_soe_loaded)
                             st.session_state.loaded_project = project_data
                             st.session_state.simulation_run = True
                             st.session_state.results = project_data['results']
@@ -1088,7 +1104,7 @@ if load_df is not None:
                             'target_md': target_md,
                             'max_discharge_power': max_discharge,
                             'battery_capacity': battery_capacity,
-                            'initial_soe': 60,
+                            'initial_soe': float(initial_soe),
                             'peak_shaving_period': {
                                 'start_time': peak_start_time.strftime("%H:%M"),
                                 'end_time': peak_end_time.strftime("%H:%M"),

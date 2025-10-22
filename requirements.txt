@@ -13,3 +13,5 @@ python-dateutil>=2.8.0
 SQLAlchemy>=2.0.0
 psycopg2-binary>=2.9.0
 python-dotenv>=1.0.1
+
+fpdf2>=2.7.0

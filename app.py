@@ -13,6 +13,18 @@ import io
 from datetime import datetime, time
 import json
 import hashlib
+import textwrap
+import plotly.io as pio
+import logging
+try:
+    from fpdf import FPDF
+    try:
+        from fpdf.enums import XPos, YPos
+    except Exception:
+        XPos = YPos = None
+except ImportError:
+    FPDF = None
+    XPos = YPos = None
 from database import (
     create_user as db_create_user,
     fetch_user,
@@ -214,6 +226,431 @@ def _format_hour_label(value) -> str:
     return f"{hour:02d}:{minute:02d}"
 
 
+def _build_pdf_report(project_name: str, config: dict, results: dict) -> bytes:
+    """Generate a PDF report summarizing the simulation."""
+    if FPDF is None:
+        raise RuntimeError("PDF export requires the 'fpdf2' package.")
+
+    analysis = results.get('analysis', {}) or {}
+    financial = config.get('financial', {}) or {}
+    ems_config = config.get('ems_config', {}) or {}
+    location = config.get('location', {}) or {}
+
+    currency_symbol = financial.get('currency_symbol') or financial.get('currency_code', '')
+    currency_code = financial.get('currency_code', '')
+    currency_display = f"{currency_symbol or ''} ({currency_code})".strip()
+
+    def _fmt_currency(value, decimals=0):
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            amount = 0.0
+        format_str = f"{{:,.{decimals}f}}"
+        if not currency_symbol:
+            return format_str.format(amount)
+        return f"{currency_symbol} {format_str.format(amount)}"
+
+    def _fmt_number(value, decimals=2, unit=""):
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return f"0{unit}"
+        format_str = f"{{:,.{decimals}f}}"
+        return f"{format_str.format(num)}{unit}"
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+
+    def _pdf_safe(text: str) -> str:
+        try:
+            text.encode("latin-1")
+            return text
+        except UnicodeEncodeError:
+            return text.encode("latin-1", "replace").decode("latin-1")
+
+    def _cell_line(width, height, text):
+        text = _pdf_safe(text)
+        if XPos and YPos:
+            pdf.cell(width, height, text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        else:
+            pdf.cell(width, height, text, ln=True)
+    bullet = "- "
+
+    def _write_lines(lines):
+        for line in lines:
+            wrapped_lines = textwrap.wrap(
+                line,
+                width=90,
+                break_long_words=False,
+                replace_whitespace=False,
+            )
+            if not wrapped_lines:
+                wrapped_lines = [line or " "]
+            for segment in wrapped_lines:
+                segment = _pdf_safe(segment)
+                pdf.set_x(pdf.l_margin)
+                if XPos and YPos:
+                    pdf.multi_cell(0, 6, segment, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                else:
+                    pdf.multi_cell(0, 6, segment, ln=True)
+
+    _cell_line(0, 10, "EnerMerlion EMS Simulation Report")
+
+    pdf.set_font("Helvetica", "", 11)
+    _cell_line(0, 7, f"Project: {project_name}")
+    _cell_line(0, 7, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    location_label = ", ".join(filter(None, [location.get('city'), location.get('country')])) or location.get('name') or "N/A"
+    _cell_line(0, 7, f"Site: {location_label}")
+    if currency_display:
+        _cell_line(0, 7, f"Currency: {currency_display}")
+
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "B", 12)
+    _cell_line(0, 8, "Key Highlights")
+    pdf.set_font("Helvetica", "", 10)
+    highlights = [
+        f"{bullet}Maximum Demand Reduction: {_fmt_number(analysis.get('total_reduction'), 0, ' kW')}",
+        f"{bullet}Annual Savings: {_fmt_currency(analysis.get('annual_savings'), 2)}",
+    ]
+    payback = analysis.get('payback_years')
+    highlights.append(f"{bullet}Payback Period: {'N/A' if payback in (None, float('inf')) else _fmt_number(payback, 1, ' years')}")
+    control_label = analysis.get('control_mode', 'time_of_control').replace('_', ' ').title()
+    highlights.append(f"{bullet}Control Mode: {control_label}")
+    _write_lines(highlights)
+
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "B", 12)
+    _cell_line(0, 8, "System Configuration")
+    pdf.set_font("Helvetica", "", 10)
+    system_lines = [
+        f"{bullet}BESS Capacity: {_fmt_number(ems_config.get('battery_capacity'), 2, ' MWh')}",
+        f"{bullet}Max Discharge Power: {_fmt_number(ems_config.get('max_discharge_power'), 0, ' kW')}",
+        f"{bullet}Initial SoE: {_fmt_number(ems_config.get('initial_soe'), 1, ' %')}",
+        f"{bullet}Target MD: {_fmt_number(ems_config.get('target_md'), 0, ' kW')}",
+    ]
+    _write_lines(system_lines)
+
+    if analysis.get('control_mode') == 'time_of_use':
+        tou_report = analysis.get('time_of_use_report') or {}
+        charge_window = tou_report.get('charge_window') or {}
+        discharge_window = tou_report.get('discharge_window') or {}
+        _write_lines([
+            f"{bullet}Charge Window: {_format_hour_label(charge_window.get('start_hour'))} - "
+            f"{_format_hour_label(charge_window.get('end_hour'))}",
+            f"{bullet}Discharge Window: {_format_hour_label(discharge_window.get('start_hour'))} - "
+            f"{_format_hour_label(discharge_window.get('end_hour'))}",
+        ])
+        min_soe = tou_report.get('min_soe_target', ems_config.get('min_soe'))
+        if min_soe is not None:
+            _write_lines([f"{bullet}Minimum SoE Target: {_fmt_number(min_soe, 1, ' %')}"])
+        last_leftover = tou_report.get('last_leftover') or {}
+        remaining_pct = last_leftover.get('excess_above_min_pct', tou_report.get('final_excess_pct', 0))
+        remaining_energy = last_leftover.get('excess_energy_kwh', tou_report.get('final_excess_energy_kwh', 0))
+        if remaining_pct and remaining_pct > 0:
+            timestamp_label = last_leftover.get('timestamp')
+            _write_lines([
+                f"{bullet}Remaining SoE after discharge: {_fmt_number(remaining_pct, 1, ' %')} "
+                f"({_fmt_number(remaining_energy, 0, ' kWh')})"
+                + (f" at {timestamp_label}" if timestamp_label else "")
+            ])
+        else:
+            _write_lines([f"{bullet}Remaining SoE after discharge: Fully utilized to minimum threshold."])
+    elif analysis.get('control_mode') == 'time_of_control':
+        toc_extension = analysis.get('time_of_control_extension') or {}
+        if toc_extension:
+            initial_excess = float(toc_extension.get('initial_excess_pct') or 0.0)
+            extension_energy = float(toc_extension.get('extension_energy_kwh') or 0.0)
+            intervals = int(toc_extension.get('extension_intervals') or 0)
+            completed = toc_extension.get('completed')
+            _write_lines([
+                f"{bullet}Post-day discharge utilization: {initial_excess:.1f}% above minimum "
+                f"(~{_fmt_number(extension_energy, 0, ' kWh')})."
+            ])
+            status_text = "completed" if completed else "incomplete"
+            _write_lines([f"{bullet}Extension run {status_text} across {intervals} additional intervals."])
+
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "B", 12)
+    _cell_line(0, 8, "Energy Performance")
+    pdf.set_font("Helvetica", "", 10)
+    energy_metrics = analysis.get('energy_metrics', {}) or {}
+    energy_lines = [
+        f"{bullet}Core Peak Discharge: {_fmt_number(energy_metrics.get('core_peak_discharge_mwh'), 2, ' MWh')}",
+        f"{bullet}Total BESS Discharge: {_fmt_number(energy_metrics.get('total_discharge_kwh'), 0, ' kWh')}",
+        f"{bullet}PV Self-Consumption: {_fmt_number(energy_metrics.get('pv_self_consumption_kwh'), 0, ' kWh')}",
+    ]
+    _write_lines(energy_lines)
+
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "B", 12)
+    _cell_line(0, 8, "Battery Health")
+    pdf.set_font("Helvetica", "", 10)
+    _write_lines([
+        f"{bullet}Final SoH: {_fmt_number(analysis.get('final_soh'), 2, ' %')}",
+        f"{bullet}Equivalent Cycles: {_fmt_number(analysis.get('equivalent_cycles'), 2)}",
+    ])
+
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "B", 12)
+    _cell_line(0, 8, "Financial Inputs")
+    pdf.set_font("Helvetica", "", 10)
+    financial_lines = [
+        f"{bullet}CAPEX: {_fmt_currency(financial.get('capex'))}",
+        f"{bullet}MD Charge: {_fmt_currency(financial.get('md_charge'), 3)} per kW",
+        f"{bullet}Peak Energy Rate: {_fmt_currency(financial.get('peak_energy_rate'), 3)} per kWh",
+        f"{bullet}Off-Peak Energy Rate: {_fmt_currency(financial.get('offpeak_energy_rate'), 3)} per kWh",
+        f"{bullet}PV savings are {('included' if analysis.get('include_pv_savings', True) else 'excluded')} in ROI calculations.",
+    ]
+    _write_lines(financial_lines)
+
+    output_data = pdf.output(dest="S")
+    if isinstance(output_data, (bytes, bytearray)):
+        return bytes(output_data)
+    return output_data.encode("latin-1")
+
+
+def _build_html_report(project_name: str, config: dict, results: dict, currency_profile: dict) -> bytes:
+    """Generate an HTML report containing inputs, key metrics, charts, and recommendations."""
+    analysis = results.get("analysis", {}) or {}
+    recommendations = results.get("recommendations", {}) or {}
+    raw_df = results.get("data")
+    chart_df = pd.DataFrame(raw_df).copy() if isinstance(raw_df, (pd.DataFrame, list, dict)) else pd.DataFrame()
+    if not chart_df.empty:
+        chart_df["timestamp"] = pd.to_datetime(chart_df["timestamp"])
+
+    financial_cfg = config.get("financial", {})
+    ems_cfg = config.get("ems_config", {})
+    pv_cfg = config.get("pv_system", {})
+    location_cfg = config.get("location", {})
+
+    def _fmt(value, decimals=2, suffix=""):
+        try:
+            return f"{float(value):,.{decimals}f}{suffix}"
+        except (TypeError, ValueError):
+            return f"0{suffix}"
+
+    def _fmt_currency_html(value, decimals=2):
+        return _format_currency(float(value or 0.0), currency_profile, decimals=decimals)
+
+    logger = logging.getLogger(__name__)
+    power_fig_html = ""
+    soe_fig_html = ""
+    savings_fig_html = ""
+    md_fig_html = ""
+
+    if not chart_df.empty:
+        time_series = chart_df["timestamp"]
+        raw_load = chart_df.get("load")
+        raw_pv = chart_df.get("pv_power")
+        raw_discharge = chart_df.get("discharge")
+        raw_soe = chart_df.get("soe")
+        logger.info(
+            "HTML report raw column types | load=%s | pv=%s | discharge=%s | soe=%s",
+            type(raw_load), type(raw_pv), type(raw_discharge), type(raw_soe)
+        )
+
+        load_series = pd.to_numeric(raw_load, errors="coerce")
+        pv_series = pd.to_numeric(raw_pv, errors="coerce")
+        discharge_series = pd.to_numeric(raw_discharge, errors="coerce").fillna(0)
+        soe_series = pd.to_numeric(raw_soe, errors="coerce")
+
+        logger.info(
+            "HTML report series stats | load min=%s max=%s | soe min=%s max=%s | discharge min=%s max=%s",
+            getattr(load_series, "min", lambda: None)(),
+            getattr(load_series, "max", lambda: None)(),
+            getattr(soe_series, "min", lambda: None)(),
+            getattr(soe_series, "max", lambda: None)(),
+            getattr(discharge_series, "min", lambda: None)(),
+            getattr(discharge_series, "max", lambda: None)(),
+        )
+
+        time_vals = time_series.tolist()
+        load_vals = load_series.astype(float).tolist() if load_series is not None else []
+        pv_vals = pv_series.astype(float).tolist() if pv_series is not None else []
+        discharge_vals = [val if val > 0 else 0 for val in discharge_series.astype(float).tolist()] if discharge_series is not None else []
+        charge_vals = [abs(val) if val < 0 else 0 for val in discharge_series.astype(float).tolist()] if discharge_series is not None else []
+        soe_vals = soe_series.astype(float).tolist() if soe_series is not None else []
+
+        x_start = min(time_vals) if time_vals else None
+        x_end = max(time_vals) if time_vals else None
+
+        power_fig = go.Figure()
+        if load_vals:
+            power_fig.add_trace(go.Scatter(x=time_vals, y=load_vals, name="Electrical Load", line=dict(color="#2d3748")))
+        if pv_vals:
+            power_fig.add_trace(go.Scatter(x=time_vals, y=pv_vals, name="PV Generation", line=dict(color="#E9B715")))
+        if discharge_vals:
+            power_fig.add_trace(go.Scatter(x=time_vals, y=discharge_vals, name="BESS Discharge", line=dict(color="#125ee2")))
+        if charge_vals and any(charge_vals):
+            power_fig.add_trace(go.Scatter(x=time_vals, y=charge_vals, name="BESS Charge", line=dict(color="#fb7185")))
+        tick_vals = pd.date_range(start=x_start, end=x_end, periods=6) if x_start and x_end else None
+        power_fig.update_layout(
+            title="Power Flow Overview",
+            xaxis_title="Timestamp",
+            yaxis_title="kW",
+            template="plotly_white",
+            xaxis=dict(range=[x_start, x_end], tickvals=tick_vals, tickformat="%H:%M\n%d-%b"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(l=60, r=30, t=70, b=40)
+        )
+        power_fig_html = pio.to_html(power_fig, include_plotlyjs=False, full_html=False)
+
+        soe_fig = go.Figure()
+        if soe_vals:
+            soe_fig.add_trace(go.Scatter(x=time_vals, y=soe_vals, name="State of Energy", line=dict(color="#0acfe9")))
+        soe_fig.update_layout(
+            title="Battery State of Energy",
+            xaxis_title="Timestamp",
+            yaxis_title="SoE (%)",
+            template="plotly_white",
+            xaxis=dict(range=[x_start, x_end], tickvals=tick_vals, tickformat="%H:%M\n%d-%b"),
+            margin=dict(l=60, r=30, t=70, b=40)
+        )
+        soe_fig_html = pio.to_html(soe_fig, include_plotlyjs=False, full_html=False)
+
+    md_fig_html = ""
+
+    savings_breakdown = analysis.get("savings_breakdown", {}) or {}
+    include_pv_bar = pv_cfg.get("total_capacity_kwp", 0) > 0 and analysis.get("include_pv_savings", True)
+    savings_categories = ["MD Savings", "Peak Discharge", "Off-Peak"]
+    savings_values = [
+        savings_breakdown.get("md_savings", 0),
+        savings_breakdown.get("peak_discharge_savings", 0),
+        savings_breakdown.get("offpeak_discharge_savings", 0),
+    ]
+    if include_pv_bar:
+        savings_categories.append("PV Self Consumption")
+        savings_values.append(savings_breakdown.get("pv_self_consumption_savings", 0))
+    savings_fig = go.Figure()
+    savings_fig.add_trace(go.Bar(x=savings_categories, y=savings_values, marker_color="#38a169"))
+    savings_fig.update_layout(title="Monthly Savings Breakdown", xaxis_title="", yaxis_title=f"Amount ({currency_profile['symbol']})", template="plotly_white")
+    savings_fig_html = pio.to_html(savings_fig, include_plotlyjs=False, full_html=False)
+
+    key_highlights = [
+        f"Maximum Demand Reduction: {_fmt(analysis.get('total_reduction'), 0, ' kW')}",
+        f"Annual Savings: {_fmt_currency_html(analysis.get('annual_savings'), 2)}",
+        f"Payback Period: {_fmt(analysis.get('payback_years'), 1, ' years')}",
+        f"Control Mode: {ems_cfg.get('control_mode', 'time_of_control').replace('_',' ').title()}",
+    ]
+
+    optimization_items = []
+    if recommendations.get("has_opportunity"):
+        optimization_items.append(f"Additional reduction potential: {_fmt(recommendations.get('additional_reduction'), 0, ' kW')}")
+        optimization_items.append(f"Suggested target MD: {_fmt(recommendations.get('suggested_target'), 0, ' kW')}")
+        optimization_items.append(f"Potential annual savings uplift: {_fmt_currency_html(recommendations.get('extra_annual_savings'), 2)}")
+    else:
+        optimization_items.append("Battery utilization is already optimal for the configured scenario.")
+
+    highlights_html = "".join(
+        f"<li>{textwrap.shorten(item, width=120, placeholder='...')}</li>" for item in key_highlights
+    )
+    optimization_html = "".join(
+        f"<li>{textwrap.shorten(item, width=140, placeholder='...')}</li>" for item in optimization_items
+    )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>EnerMerlion EMS Report - {project_name}</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <style>
+        body {{ font-family: 'Helvetica Neue', Arial, sans-serif; margin: 0; padding: 0; background: #f7f9fc; color: #1f2937; }}
+        .container {{ max-width: 1200px; margin: 0 auto; padding: 2rem; }}
+        h1, h2, h3 {{ color: #0f172a; }}
+        .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }}
+        .card {{ background: #fff; border-radius: 12px; padding: 1.5rem; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08); }}
+        .metric-value {{ font-size: 1.6rem; font-weight: 700; margin-bottom: 0.25rem; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 0.5rem; }}
+        th, td {{ padding: 0.65rem 0.8rem; border: 1px solid #e2e8f0; text-align: left; }}
+        th {{ background: #edf2f7; font-weight: 600; }}
+        ul {{ margin: 0.5rem 0 0.5rem 1.25rem; }}
+        .chart {{ margin: 1.5rem 0; }}
+        .footer {{ text-align: center; margin-top: 2rem; font-size: 0.85rem; color: #6b7280; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>EnerMerlion EMS Simulation Report</h1>
+        <p><strong>Project:</strong> {project_name}<br>
+           <strong>Generated:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M")}<br>
+           <strong>Site:</strong> {location_cfg.get("city","")} {location_cfg.get("country","")}</p>
+
+        <div class="grid">
+            <div class="card">
+                <div class="metric-label">MD Reduction</div>
+                <div class="metric-value">{_fmt(analysis.get('total_reduction'), 0, ' kW')}</div>
+            </div>
+            <div class="card">
+                <div class="metric-label">Annual Savings</div>
+                <div class="metric-value">{_fmt_currency_html(analysis.get('annual_savings'), 2)}</div>
+            </div>
+            <div class="card">
+                <div class="metric-label">Payback Period</div>
+                <div class="metric-value">{_fmt(analysis.get('payback_years'), 1, ' years')}</div>
+            </div>
+            <div class="card">
+                <div class="metric-label">Core Peak Discharge</div>
+                <div class="metric-value">{_fmt(analysis.get('energy_metrics', {}).get('core_peak_discharge_mwh'), 2, ' MWh')}</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Configuration Snapshot</h2>
+            <table>
+                <tr><th colspan="2">PV System</th></tr>
+                <tr><td>Capacity</td><td>{_fmt(pv_cfg.get('total_capacity_kwp'), 2, ' kWp')}</td></tr>
+                <tr><td>System Loss</td><td>{_fmt(pv_cfg.get('system_loss', 0)*100, 1, ' %')}</td></tr>
+                <tr><td>Inverter Capacity</td><td>{_fmt(pv_cfg.get('inverter_capacity_kw'), 2, ' kW')}</td></tr>
+                <tr><th colspan="2">Battery</th></tr>
+                <tr><td>Capacity</td><td>{_fmt(ems_cfg.get('battery_capacity'), 2, ' MWh')}</td></tr>
+                <tr><td>Max Discharge</td><td>{_fmt(ems_cfg.get('max_discharge_power'), 0, ' kW')}</td></tr>
+                <tr><td>Initial SoE</td><td>{_fmt(ems_cfg.get('initial_soe'), 1, ' %')}</td></tr>
+                <tr><td>Control Mode</td><td>{ems_cfg.get('control_mode', 'time_of_control').replace('_',' ').title()}</td></tr>
+            </table>
+        </div>
+
+        <div class="card">
+            <h2>Key Highlights</h2>
+            <ul>
+                {highlights_html}
+            </ul>
+        </div>
+
+        <div class="card">
+            <h2>Optimization Insights</h2>
+            <ul>
+                {optimization_html}
+            </ul>
+        </div>
+
+        <div class="card">
+            <h2>Financial Inputs</h2>
+            <ul>
+                <li>CAPEX: {_fmt_currency_html(financial_cfg.get('capex'), 2)}</li>
+                <li>MD Charge: {_fmt_currency_html(financial_cfg.get('md_charge'), 3)} per kW</li>
+                <li>Peak Rate: {_fmt_currency_html(financial_cfg.get('peak_energy_rate'), 3)} per kWh</li>
+                <li>Off-Peak Rate: {_fmt_currency_html(financial_cfg.get('offpeak_energy_rate'), 3)} per kWh</li>
+            </ul>
+        </div>
+
+        <div class="card chart">{power_fig_html or '<p>No power data available for charting.</p>'}</div>
+        <div class="card chart">{soe_fig_html or '<p>No SoE data available for charting.</p>'}</div>
+        <div class="card chart">{md_fig_html or '<p>No MD comparison data available.</p>'}</div>
+        <div class="card chart">{savings_fig_html}</div>
+
+        <div class="footer">
+            EnerMerLion Dynamic EMS Simulator — HTML Report
+        </div>
+    </div>
+</body>
+</html>
+"""
+    return html.encode("utf-8")
+
+
 def _resolve_currency_profile(country: str | None, *, preferred_code: str | None = None) -> dict:
     """Resolve a currency profile from country name or preferred ISO code."""
     if preferred_code:
@@ -307,7 +744,7 @@ def _apply_loaded_financial_config(financial_config: dict):
     for field_key, base_value in st.session_state.financial_base_myr.items():
         display_value = _convert_from_myr(base_value, profile)
         st.session_state.financial_inputs[field_key] = display_value
-        st.session_state[f"{field_key}_input"] = display_value
+        st.session_state.pending_financial_inputs[f"{field_key}_input"] = display_value
     st.session_state.financial_currency_code = profile["code"]
     st.session_state.currency_profile = profile
 
@@ -632,6 +1069,18 @@ if 'results' not in st.session_state:
     st.session_state.results = None
 if 'include_pv_savings' not in st.session_state:
     st.session_state.include_pv_savings = True
+if 'control_mode' not in st.session_state:
+    st.session_state.control_mode = 'time_of_control'
+if 'tou_charge_start' not in st.session_state:
+    st.session_state.tou_charge_start = time(0, 0)
+if 'tou_charge_end' not in st.session_state:
+    st.session_state.tou_charge_end = time(6, 0)
+if 'tou_discharge_start' not in st.session_state:
+    st.session_state.tou_discharge_start = time(18, 0)
+if 'tou_discharge_end' not in st.session_state:
+    st.session_state.tou_discharge_end = time(22, 0)
+if 'tou_min_soe' not in st.session_state:
+    st.session_state.tou_min_soe = 15.0
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False
 if 'current_user' not in st.session_state:
@@ -644,8 +1093,16 @@ if 'loaded_project' not in st.session_state:  # NEW: For loaded projects
     st.session_state.loaded_project = None
 if 'last_run_config' not in st.session_state:
     st.session_state.last_run_config = None
+if 'last_project_name' not in st.session_state:
+    st.session_state.last_project_name = "EMS Simulation"
 if 'currency_profile' not in st.session_state:
     st.session_state.currency_profile = DEFAULT_CURRENCY_PROFILE
+if 'pending_financial_inputs' not in st.session_state:
+    st.session_state.pending_financial_inputs = {}
+if 'pending_initial_soe' not in st.session_state:
+    st.session_state.pending_initial_soe = None
+if 'pending_location' not in st.session_state:
+    st.session_state.pending_location = {}
 if 'initial_soe_input' not in st.session_state:
     st.session_state.initial_soe_input = 60.0
 
@@ -769,6 +1226,14 @@ with st.sidebar:
     st.markdown("### 🎯 PROJECT CONFIGURATION")
     
     # Project Info with project name
+    if st.session_state.pending_location:
+        pending_loc = st.session_state.pending_location
+        if 'country' in pending_loc:
+            st.session_state['country_input'] = pending_loc['country']
+        if 'city' in pending_loc:
+            st.session_state['city_input'] = pending_loc['city']
+        st.session_state.pending_location = {}
+
     with st.expander("🌍 PROJECT LOCATION", expanded=True):
         project_name = st.text_input("PROJECT NAME", value=f"Project_{datetime.now().strftime('%Y%m%d_%H%M')}")
         col1, col2 = st.columns(2)
@@ -787,10 +1252,15 @@ with st.sidebar:
         # Unrecognized country: keep previous currency selection
         resolved_profile = _resolve_currency_profile(None, preferred_code=previous_currency_code)
     _ensure_financial_state(resolved_profile)
+    if st.session_state.pending_financial_inputs:
+        for widget_key, pending_value in st.session_state.pending_financial_inputs.items():
+            st.session_state[widget_key] = pending_value
+        st.session_state.pending_financial_inputs = {}
     if st.session_state.financial_currency_code != resolved_profile["code"]:
         for field_key, base_value in st.session_state.financial_base_myr.items():
             updated_value = _convert_from_myr(base_value, resolved_profile)
             st.session_state.financial_inputs[field_key] = updated_value
+            st.session_state.pending_financial_inputs[f"{field_key}_input"] = updated_value
             st.session_state[f"{field_key}_input"] = updated_value
         st.session_state.financial_currency_code = resolved_profile["code"]
     st.session_state.currency_profile = resolved_profile
@@ -874,6 +1344,9 @@ with st.sidebar:
                 step=100.0
             )
         
+        if st.session_state.pending_initial_soe is not None:
+            st.session_state.initial_soe_input = float(st.session_state.pending_initial_soe)
+            st.session_state.pending_initial_soe = None
         initial_soe = st.number_input(
             "INITIAL SOE (%)",
             min_value=0.0,
@@ -884,36 +1357,114 @@ with st.sidebar:
     
     # Target Settings
     with st.expander("🎯 CONTROL STRATEGY", expanded=True):
-        default_peak_start = time(18, 0)
-        default_peak_end = time(22, 0)
-
+        control_mode_labels = {
+            "TIME-OF-CONTROL MODE": "time_of_control",
+            "TIME-OF-USE MODE": "time_of_use",
+        }
+        loaded_control_mode = st.session_state.control_mode
         if st.session_state.loaded_project:
-            project_peak_config = st.session_state.loaded_project['config']['ems_config'].get('peak_shaving_period', {})
-            peak_start_prefill = _parse_time_value(
-                project_peak_config.get('start_time') or project_peak_config.get('start'),
-                default_peak_start
+            loaded_control_mode = st.session_state.loaded_project['config']['ems_config'].get(
+                'control_mode', loaded_control_mode
             )
-            peak_end_prefill = _parse_time_value(
-                project_peak_config.get('end_time') or project_peak_config.get('end'),
-                default_peak_end
+        mode_to_label = {v: k for k, v in control_mode_labels.items()}
+        default_label = mode_to_label.get(loaded_control_mode, "TIME-OF-CONTROL MODE")
+        label_list = list(control_mode_labels.keys())
+        default_index = label_list.index(default_label)
+        selected_label = st.selectbox(
+            "CONTROL MODE",
+            label_list,
+            index=default_index,
+            help="Switch between the adaptive Time-of-Control algorithm and the schedule-based Time-of-Use mode."
+        )
+        control_mode = control_mode_labels[selected_label]
+        st.session_state.control_mode = control_mode
+
+        peak_period_valid = True
+        if control_mode == 'time_of_control':
+            default_peak_start = time(18, 0)
+            default_peak_end = time(22, 0)
+
+            if st.session_state.loaded_project:
+                project_peak_config = st.session_state.loaded_project['config']['ems_config'].get('peak_shaving_period', {})
+                peak_start_prefill = _parse_time_value(
+                    project_peak_config.get('start_time') or project_peak_config.get('start'),
+                    default_peak_start
+                )
+                peak_end_prefill = _parse_time_value(
+                    project_peak_config.get('end_time') or project_peak_config.get('end'),
+                    default_peak_end
+                )
+            else:
+                peak_start_prefill = default_peak_start
+                peak_end_prefill = default_peak_end
+
+            peak_start_time = st.time_input(
+                "BESS PEAK SHAVING START",
+                value=peak_start_prefill,
+                help="Define when the battery begins peak shaving (default 18:00)."
             )
+            peak_end_time = st.time_input(
+                "BESS PEAK SHAVING END",
+                value=peak_end_prefill,
+                help="Define when the battery stops peak shaving (default 22:00)."
+            )
+
+            if peak_end_time <= peak_start_time:
+                st.error("⚠️ Peak shaving end time must be later than the start time.")
+            peak_period_valid = peak_end_time > peak_start_time
         else:
-            peak_start_prefill = default_peak_start
-            peak_end_prefill = default_peak_end
+            peak_start_time = time(18, 0)
+            peak_end_time = time(22, 0)
 
-        peak_start_time = st.time_input(
-            "BESS PEAK SHAVING START",
-            value=peak_start_prefill,
-            help="Define when the battery begins peak shaving (default 18:00)."
-        )
-        peak_end_time = st.time_input(
-            "BESS PEAK SHAVING END",
-            value=peak_end_prefill,
-            help="Define when the battery stops peak shaving (default 22:00)."
-        )
+            charge_col1, charge_col2 = st.columns(2)
+            with charge_col1:
+                charge_start_input = st.time_input(
+                    "CHARGE WINDOW START",
+                    value=st.session_state.tou_charge_start,
+                    key="tou_charge_start_input",
+                    help="Time-of-Use charging window start (e.g. off-peak or PV surplus hours)."
+                )
+            with charge_col2:
+                charge_end_input = st.time_input(
+                    "CHARGE WINDOW END",
+                    value=st.session_state.tou_charge_end,
+                    key="tou_charge_end_input",
+                    help="Charging window end. If the start is later than the end, the window wraps past midnight."
+                )
 
-        if peak_end_time <= peak_start_time:
-            st.error("⚠️ Peak shaving end time must be later than the start time.")
+            discharge_col1, discharge_col2 = st.columns(2)
+            with discharge_col1:
+                discharge_start_input = st.time_input(
+                    "DISCHARGE WINDOW START",
+                    value=st.session_state.tou_discharge_start,
+                    key="tou_discharge_start_input",
+                    help="Begin discharging at rated power during this window."
+                )
+            with discharge_col2:
+                discharge_end_input = st.time_input(
+                    "DISCHARGE WINDOW END",
+                    value=st.session_state.tou_discharge_end,
+                    key="tou_discharge_end_input",
+                    help="End of the discharging window. Supports wrap-around to early morning hours."
+                )
+
+            st.session_state.tou_charge_start = charge_start_input
+            st.session_state.tou_charge_end = charge_end_input
+            st.session_state.tou_discharge_start = discharge_start_input
+            st.session_state.tou_discharge_end = discharge_end_input
+
+            tou_min_soe_input = st.number_input(
+                "MINIMUM ALLOWED SOE (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(st.session_state.tou_min_soe),
+                step=1.0,
+                key="tou_min_soe_input",
+                help="Battery keeps discharging until this SoE threshold is hit."
+            )
+            st.session_state.tou_min_soe = float(tou_min_soe_input)
+
+            st.caption("ℹ️ Discharge windows can span midnight. The controller continues into the next day until the minimum SoE is reached.")
 
         target_md = st.number_input(
             "TARGET MD (KW)", 
@@ -924,7 +1475,15 @@ with st.sidebar:
 
     peak_start_decimal = peak_start_time.hour + peak_start_time.minute / 60
     peak_end_decimal = peak_end_time.hour + peak_end_time.minute / 60
-    peak_period_valid = peak_end_decimal > peak_start_decimal
+    tou_charge_start_time = st.session_state.tou_charge_start
+    tou_charge_end_time = st.session_state.tou_charge_end
+    tou_discharge_start_time = st.session_state.tou_discharge_start
+    tou_discharge_end_time = st.session_state.tou_discharge_end
+    tou_charge_start_decimal = tou_charge_start_time.hour + tou_charge_start_time.minute / 60
+    tou_charge_end_decimal = tou_charge_end_time.hour + tou_charge_end_time.minute / 60
+    tou_discharge_start_decimal = tou_discharge_start_time.hour + tou_discharge_start_time.minute / 60
+    tou_discharge_end_decimal = tou_discharge_end_time.hour + tou_discharge_end_time.minute / 60
+    tou_min_soe = st.session_state.tou_min_soe
     
     # Financial Parameters
     with st.expander("💰 FINANCIAL PARAMETERS", expanded=True):
@@ -1020,14 +1579,38 @@ with st.sidebar:
                             loaded_country = parts[-1]
                         if len(parts) > 1:
                             loaded_city = parts[0]
+                    location_pending = {}
                     if loaded_country:
-                        st.session_state.country_input = loaded_country
+                        location_pending['country'] = loaded_country
                     if loaded_city:
-                        st.session_state.city_input = loaded_city
-                    initial_soe_loaded = project_data['config']['ems_config'].get('initial_soe')
+                        location_pending['city'] = loaded_city
+                    if location_pending:
+                        st.session_state.pending_location = location_pending
+                    ems_config_loaded = project_data['config'].get('ems_config', {})
+                    initial_soe_loaded = ems_config_loaded.get('initial_soe')
                     if initial_soe_loaded is not None:
-                        st.session_state.initial_soe_input = float(initial_soe_loaded)
+                        st.session_state.pending_initial_soe = float(initial_soe_loaded)
+                    control_mode_loaded = ems_config_loaded.get('control_mode', 'time_of_control')
+                    st.session_state.control_mode = control_mode_loaded
+                    tou_cfg = ems_config_loaded.get('time_of_use', {})
+                    charge_cfg = tou_cfg.get('charge_window', {})
+                    discharge_cfg = tou_cfg.get('discharge_window', {})
+                    st.session_state.tou_charge_start = _parse_time_value(
+                        charge_cfg.get('start_time'), st.session_state.tou_charge_start
+                    )
+                    st.session_state.tou_charge_end = _parse_time_value(
+                        charge_cfg.get('end_time'), st.session_state.tou_charge_end
+                    )
+                    st.session_state.tou_discharge_start = _parse_time_value(
+                        discharge_cfg.get('start_time'), st.session_state.tou_discharge_start
+                    )
+                    st.session_state.tou_discharge_end = _parse_time_value(
+                        discharge_cfg.get('end_time'), st.session_state.tou_discharge_end
+                    )
+                    if tou_cfg.get('min_soe') is not None:
+                        st.session_state.tou_min_soe = float(tou_cfg['min_soe'])
                     st.session_state.loaded_project = project_data
+                    st.session_state.last_project_name = project_data['project_name']
                     st.session_state.simulation_run = True
                     st.session_state.results = project_data['results']
                     st.session_state.include_pv_savings = project_data['config']['financial'].get('include_pv_savings', True)
@@ -1054,14 +1637,38 @@ with st.sidebar:
                                     loaded_country = parts[-1]
                                 if len(parts) > 1:
                                     loaded_city = parts[0]
+                            location_pending = {}
                             if loaded_country:
-                                st.session_state.country_input = loaded_country
+                                location_pending['country'] = loaded_country
                             if loaded_city:
-                                st.session_state.city_input = loaded_city
-                            initial_soe_loaded = project_data['config']['ems_config'].get('initial_soe')
+                                location_pending['city'] = loaded_city
+                            if location_pending:
+                                st.session_state.pending_location = location_pending
+                            ems_config_loaded = project_data['config'].get('ems_config', {})
+                            initial_soe_loaded = ems_config_loaded.get('initial_soe')
                             if initial_soe_loaded is not None:
-                                st.session_state.initial_soe_input = float(initial_soe_loaded)
+                                st.session_state.pending_initial_soe = float(initial_soe_loaded)
+                            control_mode_loaded = ems_config_loaded.get('control_mode', 'time_of_control')
+                            st.session_state.control_mode = control_mode_loaded
+                            tou_cfg = ems_config_loaded.get('time_of_use', {})
+                            charge_cfg = tou_cfg.get('charge_window', {})
+                            discharge_cfg = tou_cfg.get('discharge_window', {})
+                            st.session_state.tou_charge_start = _parse_time_value(
+                                charge_cfg.get('start_time'), st.session_state.tou_charge_start
+                            )
+                            st.session_state.tou_charge_end = _parse_time_value(
+                                charge_cfg.get('end_time'), st.session_state.tou_charge_end
+                            )
+                            st.session_state.tou_discharge_start = _parse_time_value(
+                                discharge_cfg.get('start_time'), st.session_state.tou_discharge_start
+                            )
+                            st.session_state.tou_discharge_end = _parse_time_value(
+                                discharge_cfg.get('end_time'), st.session_state.tou_discharge_end
+                            )
+                            if tou_cfg.get('min_soe') is not None:
+                                st.session_state.tou_min_soe = float(tou_cfg['min_soe'])
                             st.session_state.loaded_project = project_data
+                            st.session_state.last_project_name = project_data['project_name']
                             st.session_state.simulation_run = True
                             st.session_state.results = project_data['results']
                             st.session_state.include_pv_savings = project_data['config']['financial'].get('include_pv_savings', True)
@@ -1084,11 +1691,26 @@ if load_df is not None:
         )
     
     if run_button:
-        if not peak_period_valid:
+        if control_mode == 'time_of_control' and not peak_period_valid:
             st.error("❌ Please ensure the peak shaving end time is later than the start time before running the simulation.")
         else:
             with st.spinner("🔄 RUNNING INDUSTRIAL SIMULATION..."):
                 try:
+                    tou_config = {
+                        'charge_window': {
+                            'start_time': tou_charge_start_time.strftime("%H:%M"),
+                            'end_time': tou_charge_end_time.strftime("%H:%M"),
+                            'start_hour': tou_charge_start_decimal,
+                            'end_hour': tou_charge_end_decimal
+                        },
+                        'discharge_window': {
+                            'start_time': tou_discharge_start_time.strftime("%H:%M"),
+                            'end_time': tou_discharge_end_time.strftime("%H:%M"),
+                            'start_hour': tou_discharge_start_decimal,
+                            'end_hour': tou_discharge_end_decimal
+                        },
+                        'min_soe': tou_min_soe
+                    }
                     config = {
                         'location': {
                             'name': f"{city}, {country}",
@@ -1105,6 +1727,8 @@ if load_df is not None:
                             'max_discharge_power': max_discharge,
                             'battery_capacity': battery_capacity,
                             'initial_soe': float(initial_soe),
+                            'control_mode': control_mode,
+                            'time_of_use': tou_config,
                             'peak_shaving_period': {
                                 'start_time': peak_start_time.strftime("%H:%M"),
                                 'end_time': peak_end_time.strftime("%H:%M"),
@@ -1140,6 +1764,7 @@ if load_df is not None:
                     st.session_state.simulation_run = True
                     st.session_state.results = results
                     st.session_state.last_run_config = config
+                    st.session_state.last_project_name = project_name
                     
                     if save_success:
                         st.success("✅ SIMULATION COMPLETED & SAVED")
@@ -1159,8 +1784,43 @@ if st.session_state.simulation_run and st.session_state.results is not None:
             st.session_state.simulation_run = False
             st.session_state.results = None
             st.rerun()
+    config_for_export = st.session_state.last_run_config
+    project_title = st.session_state.get('last_project_name', 'EMS Simulation')
+    currency_profile_display = _get_active_currency_profile()
+
+    html_bytes = None
+    html_message = None
+    if config_for_export:
+        try:
+            html_bytes = _build_html_report(project_title, config_for_export, results, currency_profile_display)
+        except Exception as exc:
+            html_message = "HTML export unavailable."
+            logging.getLogger(__name__).exception("HTML export failed: %s", exc)
+    else:
+        html_message = "HTML export unavailable (missing config)."
+
+    pdf_bytes = None
+    pdf_message = "PDF export has been disabled. Please use the HTML report download above."
+
     st.markdown("---")
-    st.markdown("## 📊 SIMULATION RESULTS")
+    header_col1, header_col2 = st.columns([3, 1])
+    with header_col1:
+        st.markdown("## 📊 SIMULATION RESULTS")
+    with header_col2:
+        safe_stub = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in project_title) or "ems_report"
+        if html_bytes:
+            html_file = f"{safe_stub.lower()}_report.html"
+            st.download_button(
+                "🌐 DOWNLOAD HTML REPORT",
+                data=html_bytes,
+                file_name=html_file,
+                mime="text/html",
+                use_container_width=True
+            )
+        elif html_message:
+            st.caption(html_message)
+        if pdf_message:
+            st.caption(pdf_message)
     
     # Display PV Savings Inclusion Status
     savings_status = "INCLUDED" if st.session_state.include_pv_savings else "EXCLUDED"
@@ -1176,7 +1836,6 @@ if st.session_state.simulation_run and st.session_state.results is not None:
     </div>
     """, unsafe_allow_html=True)
     
-    currency_profile_display = _get_active_currency_profile()
     currency_label = f"{currency_profile_display['symbol']} ({currency_profile_display['code']})"
     annual_savings_display = _format_currency(results['analysis']['annual_savings'], currency_profile_display)
     peak_period_cfg = (st.session_state.last_run_config or {}).get('ems_config', {}).get('peak_shaving_period', {})
@@ -1220,6 +1879,82 @@ if st.session_state.simulation_run and st.session_state.results is not None:
                 f"CORE PEAK SHAVING ({peak_window_label})",
                 f"{core_peak_mwh:.2f} MWh"
             )
+
+    if results['analysis'].get('control_mode') == 'time_of_use':
+        tou_report = results['analysis'].get('time_of_use_report') or {}
+        charge_win = tou_report.get('charge_window') or {}
+        discharge_win = tou_report.get('discharge_window') or {}
+        charge_label = f"{_format_hour_label(charge_win.get('start_hour'))} – {_format_hour_label(charge_win.get('end_hour'))}"
+        discharge_label = f"{_format_hour_label(discharge_win.get('start_hour'))} – {_format_hour_label(discharge_win.get('end_hour'))}"
+        min_soe_target = tou_report.get('min_soe_target')
+        if min_soe_target is None:
+            min_soe_target = st.session_state.tou_min_soe
+        avg_excess_pct = float(tou_report.get('avg_excess_pct', 0.0) or 0.0)
+        final_excess_pct = float(tou_report.get('final_excess_pct', 0.0) or 0.0)
+        final_excess_energy = float(tou_report.get('final_excess_energy_kwh', 0.0) or 0.0)
+        last_leftover = tou_report.get('last_leftover') or {}
+        leftover_timestamp = last_leftover.get('timestamp')
+        min_soe_display = f"{float(min_soe_target):.1f} %" if min_soe_target is not None else "N/A"
+
+        st.markdown("#### 🕒 TIME-OF-USE MODE INSIGHTS")
+        tcol1, tcol2, tcol3 = st.columns(3)
+        with tcol1:
+            st.markdown(f"**Charge Window**<br>{charge_label}", unsafe_allow_html=True)
+        with tcol2:
+            st.markdown(f"**Discharge Window**<br>{discharge_label}", unsafe_allow_html=True)
+        with tcol3:
+            st.markdown(f"**Minimum SoE Target**<br>{min_soe_display}", unsafe_allow_html=True)
+
+        if final_excess_pct and final_excess_pct > 0.05:
+            leftover_text = (
+                f"Remaining SoE after the scheduled discharge: {final_excess_pct:.1f}% "
+                f"(~{final_excess_energy:,.0f} kWh)."
+            )
+            if leftover_timestamp:
+                try:
+                    timestamp_fmt = pd.to_datetime(leftover_timestamp).strftime('%Y-%m-%d %H:%M')
+                except Exception:
+                    timestamp_fmt = str(leftover_timestamp)
+                leftover_text += f" Last recorded at {timestamp_fmt}."
+            st.info(leftover_text)
+            if avg_excess_pct:
+                st.caption(f"Average leftover across windows: {avg_excess_pct:.1f}% above the minimum.")
+        else:
+            st.success("Battery discharged to its minimum State-of-Energy across the configured window.")
+
+        leftover_events = tou_report.get('leftover_events') or []
+        if leftover_events:
+            with st.expander("Discharge leftover log"):
+                events_df = pd.DataFrame(leftover_events)
+                if 'timestamp' in events_df.columns:
+                    events_df['timestamp'] = pd.to_datetime(events_df['timestamp'])
+                display_df = events_df.rename(columns={
+                    'timestamp': 'Timestamp',
+                    'remaining_soe': 'SoE (%)',
+                    'excess_above_min_pct': 'Excess Above Min (%)',
+                    'excess_energy_kwh': 'Excess Energy (kWh)',
+                    'note': 'Note'
+                })
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+    elif results['analysis'].get('control_mode') == 'time_of_control':
+        toc_extension = results['analysis'].get('time_of_control_extension') or {}
+        if toc_extension:
+            initial_excess_pct = float(toc_extension.get('initial_excess_pct') or 0.0)
+            extension_energy_kwh = float(toc_extension.get('extension_energy_kwh') or 0.0)
+            intervals_used = int(toc_extension.get('extension_intervals') or 0)
+            completed = bool(toc_extension.get('completed'))
+            st.markdown("#### 🕒 EXTENDED DISCHARGE (TIME-OF-CONTROL)")
+            if initial_excess_pct > 0.05:
+                message = (
+                    f"Post-day surplus of {initial_excess_pct:.1f}% "
+                    f"(~{extension_energy_kwh:,.0f} kWh) discharged across {intervals_used} early intervals."
+                )
+                if completed:
+                    st.info(f"{message} Battery reached the configured minimum SoE.")
+                else:
+                    st.warning(f"{message} Battery did not reach the minimum SoE within the available window.")
+            else:
+                st.success("Battery already met the minimum SoE by the end of the primary simulation window.")
     
     # System Alerts
     if 'inverter_clipping' in results['analysis']:

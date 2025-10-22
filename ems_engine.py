@@ -8,6 +8,127 @@ import numpy as np
 from datetime import datetime
 from ems_controller_penang_optimized import AdvancedEMSController
 
+
+class TimeOfUseController:
+    """Schedule-based Time-of-Use controller for BESS operations."""
+
+    def __init__(
+        self,
+        *,
+        max_power: float,
+        battery_capacity: float,
+        charge_window: dict,
+        discharge_window: dict,
+        min_soe: float = 15.0,
+        max_soe: float = 90.0,
+        roundtrip_efficiency: float = 0.90,
+    ):
+        self.max_power = max(0.0, float(max_power))
+        self.battery_capacity = max(0.0, float(battery_capacity))
+        self.charge_window = self._normalize_window(charge_window)
+        self.discharge_window = self._normalize_window(discharge_window)
+        self.soe_min = max(0.0, min(float(min_soe), 100.0))
+        self.soe_max = max(self.soe_min, min(float(max_soe), 100.0))
+        self.roundtrip_efficiency = max(0.10, min(roundtrip_efficiency, 1.0))
+        self.interval_hours = 5 / 60  # Simulation granularity (5 minutes)
+
+        # Battery health tracking (simplified)
+        self.current_soh = 100.0
+        self.actual_capacity_mwh = self.battery_capacity
+        self.total_cycles = 0.0
+        self.total_throughput_mwh = 0.0
+        self.estimated_cycles = 4000.0
+
+    @staticmethod
+    def _normalize_window(window: dict) -> dict:
+        start = float(window.get('start_hour', 0.0) or 0.0) % 24
+        end = float(window.get('end_hour', 0.0) or 0.0) % 24
+        return {'start_hour': start, 'end_hour': end}
+
+    @staticmethod
+    def _to_decimal_hour(current_time) -> float:
+        return current_time.hour + current_time.minute / 60.0 + current_time.second / 3600.0
+
+    def _in_window(self, current_time, window: dict) -> bool:
+        current_hour = self._to_decimal_hour(current_time)
+        start = window['start_hour']
+        end = window['end_hour']
+        if abs(start - end) < 1e-6:
+            return False  # Empty window
+        if start <= end:
+            return start <= current_hour < end
+        return current_hour >= start or current_hour < end
+
+    def is_priority_charge_period(self, current_time) -> bool:
+        return self._in_window(current_time, self.charge_window)
+
+    def is_constrained_charge_period(self, current_time) -> bool:
+        return False
+
+    def is_discharge_period(self, current_time) -> bool:
+        return self._in_window(current_time, self.discharge_window)
+
+    def control_decision(self, soe, net_load, current_time, load=None, pv_power=None) -> float:
+        """
+        Returns discharge power in kW (positive means discharge, negative means charge).
+        """
+        if self.battery_capacity <= 0 or self.max_power <= 0:
+            return 0.0
+
+        # Discharge takes precedence over charging when both windows overlap
+        if self.is_discharge_period(current_time) and soe > self.soe_min:
+            available_delta = max(0.0, soe - self.soe_min)
+            max_by_soe = (
+                available_delta / 100
+                * self.battery_capacity
+                * 1000
+                * self.roundtrip_efficiency
+                / self.interval_hours
+            )
+            discharge_power = min(self.max_power, max_by_soe)
+            if discharge_power <= 0:
+                return 0.0
+            return discharge_power
+
+        if self.is_priority_charge_period(current_time) and soe < self.soe_max:
+            missing_delta = max(0.0, self.soe_max - soe)
+            max_by_soe = (
+                missing_delta / 100
+                * self.battery_capacity
+                * 1000
+                / (self.interval_hours * self.roundtrip_efficiency)
+            )
+            charge_power = min(self.max_power, max_by_soe)
+            if charge_power <= 0:
+                return 0.0
+            return -charge_power
+
+        return 0.0
+
+    def update_soh_degradation(self, energy_discharged_mwh: float):
+        if energy_discharged_mwh <= 0 or self.battery_capacity <= 0:
+            return
+        equivalent_cycle = energy_discharged_mwh / self.battery_capacity
+        self.total_cycles += equivalent_cycle
+        self.total_throughput_mwh += energy_discharged_mwh
+        degradation_per_cycle = 0.0025
+        soh_loss = equivalent_cycle * degradation_per_cycle
+        self.current_soh = max(80.0, self.current_soh - soh_loss)
+        self.actual_capacity_mwh = self.battery_capacity * (self.current_soh / 100)
+
+    def get_battery_health_report(self):
+        remaining_cycles = max(0.0, self.estimated_cycles - self.total_cycles)
+        remaining_years = remaining_cycles / 365 if remaining_cycles > 0 else 0.0
+        return {
+            'current_soh': self.current_soh,
+            'actual_capacity_mwh': self.actual_capacity_mwh,
+            'total_cycles': self.total_cycles,
+            'total_throughput_mwh': self.total_throughput_mwh,
+            'remaining_cycles': remaining_cycles,
+            'remaining_years': remaining_years,
+            'capacity_fade': 100 - self.current_soh
+        }
+
 class EMSEngine:
     """
     Energy Management System simulation engine
@@ -147,7 +268,15 @@ class EMSEngine:
     def _run_ems_simulation(self, data_df):
         """Run EMS control simulation"""
         ems_config = self.config['ems_config']
-        peak_config = ems_config.get('peak_shaving_period', {})
+        control_mode = ems_config.get('control_mode', 'time_of_control')
+        tou_config = ems_config.get('time_of_use', {}) or {}
+        peak_config = ems_config.get('peak_shaving_period', {}) or {}
+
+        self.control_mode = control_mode
+        self.tou_charge_window = None
+        self.tou_discharge_window = None
+        self.tou_min_soe = tou_config.get('min_soe')
+        self.tou_max_soe = tou_config.get('max_soe')
         peak_start_hour = peak_config.get('start_hour')
         peak_end_hour = peak_config.get('end_hour')
 
@@ -168,15 +297,45 @@ class EMSEngine:
         
         self.peak_start_hour = peak_start_hour
         self.peak_end_hour = peak_end_hour
-        
-        # Initialize controller
-        self.controller = AdvancedEMSController(
-            target_md=ems_config['target_md'],
-            max_power=ems_config['max_discharge_power'],
-            battery_capacity=ems_config['battery_capacity'],
-            peak_start_hour=peak_start_hour,
-            peak_end_hour=peak_end_hour
-        )
+
+        if control_mode == 'time_of_use':
+            def _resolve_window(window_cfg, default_start, default_end):
+                start_val = window_cfg.get('start_hour')
+                end_val = window_cfg.get('end_hour')
+                if start_val is None:
+                    start_val = self._parse_decimal_hour(window_cfg.get('start_time'))
+                if end_val is None:
+                    end_val = self._parse_decimal_hour(window_cfg.get('end_time'))
+                if start_val is None:
+                    start_val = default_start
+                if end_val is None:
+                    end_val = default_end
+                return {
+                    'start_hour': float(start_val) % 24,
+                    'end_hour': float(end_val) % 24
+                }
+
+            self.tou_charge_window = _resolve_window(tou_config.get('charge_window', {}), 0.0, 6.0)
+            self.tou_discharge_window = _resolve_window(tou_config.get('discharge_window', {}), 18.0, 22.0)
+
+            self.controller = TimeOfUseController(
+                max_power=ems_config['max_discharge_power'],
+                battery_capacity=ems_config['battery_capacity'],
+                charge_window=self.tou_charge_window,
+                discharge_window=self.tou_discharge_window,
+                min_soe=tou_config.get('min_soe', 15.0),
+                max_soe=tou_config.get('max_soe', 90.0),
+                roundtrip_efficiency=0.90
+            )
+        else:
+            # Initialize controller for Time-of-Control mode
+            self.controller = AdvancedEMSController(
+                target_md=ems_config['target_md'],
+                max_power=ems_config['max_discharge_power'],
+                battery_capacity=ems_config['battery_capacity'],
+                peak_start_hour=peak_start_hour,
+                peak_end_hour=peak_end_hour
+            )
         
         # Initialize results storage
         results = {
@@ -189,18 +348,22 @@ class EMSEngine:
         
         soe = ems_config['initial_soe']
         rte = 0.90
-        
-        # Simulation loop
-        for idx, row in data_df.iterrows():
-            ts, load, pv = row['timestamp'], row['load'], row['pv_power']
-            
-            # Get control decision
+        interval_hours = 5 / 60
+        track_tou = control_mode == 'time_of_use'
+        was_in_discharge_window = False
+        tou_leftover_events = []
+        time_of_control_extension = None
+
+        def process_interval(ts, load, pv, net_load):
+            nonlocal soe, was_in_discharge_window
+            prev_soe = soe
+            in_discharge_window = self.controller.is_discharge_period(ts) if track_tou else False
+
             discharge = self.controller.control_decision(
-                soe=soe, net_load=row['net_load'], 
+                soe=soe, net_load=net_load,
                 current_time=ts, load=load, pv_power=pv
             )
-            
-            # Calculate power flows
+
             if discharge < 0:  # Charging
                 charge_power = abs(discharge)
                 if self.controller.is_priority_charge_period(ts) or \
@@ -213,51 +376,112 @@ class EMSEngine:
                     pv_to_battery, pv_to_load = 0, min(pv, load)
                     grid_import = max(0, load - pv_to_load)
                     pv_curtailment = max(0, pv - pv_to_load)
-                
-                soe += (charge_power * 5/60 / 1000 / ems_config['battery_capacity']) * 100 * rte
-                
+
+                soe += (charge_power * interval_hours / 1000 / ems_config['battery_capacity']) * 100 * rte
+
             elif discharge > 0:  # Discharging
                 pv_to_battery = 0
                 pv_to_load = min(pv, load)
                 grid_import = max(0, load - pv_to_load - discharge)
                 pv_curtailment = max(0, pv - pv_to_load)
-                
-                soe -= (discharge * 5/60 / 1000 / ems_config['battery_capacity']) * 100 / rte
-                self.controller.update_soh_degradation(discharge * 5/60 / 1000)
-                
+
+                soe -= (discharge * interval_hours / 1000 / ems_config['battery_capacity']) * 100 / rte
+                self.controller.update_soh_degradation(discharge * interval_hours / 1000)
+
             else:  # Standby
                 pv_to_battery = 0
                 pv_to_load = min(pv, load)
                 grid_import = max(0, load - pv_to_load)
                 pv_curtailment = max(0, pv - pv_to_load)
-            
-            # Constrain SoE
+
             soe = max(self.controller.soe_min, min(self.controller.soe_max, soe))
-            
-            # Store results
+
             for k, v in zip(
                 ['timestamp', 'load', 'pv_power', 'net_load', 'discharge', 'soe',
                  'grid_import', 'pv_to_load', 'pv_to_battery', 'pv_curtailment', 'current_soh'],
-                [ts, load, pv, row['net_load'], discharge, soe,
+                [ts, load, pv, net_load, discharge, soe,
                  grid_import, pv_to_load, pv_to_battery, pv_curtailment, self.controller.current_soh]
             ):
                 results[k].append(v)
-            
-            # Calculate rolling MD (30-minute moving average)
-            window_size = min(6, len(results['load']))  # 6 intervals = 30 minutes
-            
-            # 1. Baseline: No PV, No EMS
+
+            window_size = min(6, len(results['load']))
             results['md30_no_pv_no_ems'].append(sum(results['load'][-window_size:]) / window_size)
-            
-            # 2. With PV Only: Net load with PV but no battery
             results['md30_with_pv_no_ems'].append(
                 sum([max(0, results['load'][i] - results['pv_power'][i])
                      for i in range(len(results['load']) - window_size, len(results['load']))]) / window_size
             )
-            
-            # 3. With PV + EMS: Grid import after PV and battery
             results['md30_with_pv_with_ems'].append(sum(results['grid_import'][-window_size:]) / window_size)
-        
+
+            if track_tou:
+                if was_in_discharge_window and not in_discharge_window:
+                    leftover_soe = max(0.0, prev_soe - self.controller.soe_min)
+                    leftover_energy_kwh = (leftover_soe / 100) * ems_config['battery_capacity'] * 1000
+                    tou_leftover_events.append({
+                        'timestamp': ts,
+                        'remaining_soe': soe,
+                        'excess_above_min_pct': leftover_soe,
+                        'excess_energy_kwh': leftover_energy_kwh
+                    })
+                was_in_discharge_window = in_discharge_window
+
+            return discharge, prev_soe, soe
+
+        # Primary simulation loop
+        for _, row in data_df.iterrows():
+            process_interval(row['timestamp'], row['load'], row['pv_power'], row['net_load'])
+
+        # Capture leftover for Time-of-Use mode
+        if track_tou and was_in_discharge_window:
+            leftover_soe = max(0.0, soe - self.controller.soe_min)
+            leftover_energy_kwh = (leftover_soe / 100) * ems_config['battery_capacity'] * 1000
+            tou_leftover_events.append({
+                'timestamp': data_df.iloc[-1]['timestamp'],
+                'remaining_soe': soe,
+                'excess_above_min_pct': leftover_soe,
+                'excess_energy_kwh': leftover_energy_kwh,
+                'note': 'simulation ended within discharge window'
+            })
+
+        # Time-of-Control extension: continue into next day until minimum SoE
+        if control_mode == 'time_of_control' and soe > self.controller.soe_min + 1e-6:
+            pre_extension_soe = soe
+            extension_energy_kwh = 0.0
+            extension_intervals = 0
+
+            charge_start_hour = getattr(self.controller, 'charge_start_hour', 0.0)
+            extension_candidates = data_df[
+                (data_df['timestamp'].dt.hour + data_df['timestamp'].dt.minute / 60.0) < charge_start_hour
+            ]
+            if extension_candidates.empty:
+                extension_candidates = data_df.copy()
+
+            max_cycles = 3
+            cycle = 0
+            while soe > self.controller.soe_min + 1e-6 and cycle < max_cycles and not extension_candidates.empty:
+                day_offset = cycle + 1
+                for _, ext_row in extension_candidates.iterrows():
+                    if soe <= self.controller.soe_min + 1e-6:
+                        break
+                    extended_ts = ext_row['timestamp'] + pd.Timedelta(days=day_offset)
+                    discharge, prev_soe, new_soe = process_interval(
+                        extended_ts, ext_row['load'], ext_row['pv_power'], ext_row['net_load']
+                    )
+                    delta_pct = max(0.0, prev_soe - new_soe)
+                    extension_energy_kwh += (delta_pct / 100) * ems_config['battery_capacity'] * 1000
+                    extension_intervals += 1
+                cycle += 1
+
+            time_of_control_extension = {
+                'initial_excess_pct': max(0.0, pre_extension_soe - self.controller.soe_min),
+                'final_soe_pct': soe,
+                'extension_intervals': extension_intervals,
+                'extension_energy_kwh': extension_energy_kwh,
+                'completed': soe <= self.controller.soe_min + 1e-6
+            }
+
+        self.tou_leftover_events = tou_leftover_events
+        self.tou_final_soe = soe
+        self.time_of_control_extension = time_of_control_extension
         return pd.DataFrame(results)
     
     def _analyze_results(self, results_df):
@@ -394,6 +618,50 @@ class EMSEngine:
         roi_10yr = (annual_savings_for_roi * 10 - capex) / capex * 100 if annual_savings_for_roi > 0 else float('-inf')
         
         health = self.controller.get_battery_health_report()
+        time_of_use_report = None
+        if self.control_mode == 'time_of_use':
+            events = getattr(self, 'tou_leftover_events', [])
+            battery_capacity_mwh = ems_config['battery_capacity']
+            simplified_events = []
+            for ev in events:
+                simplified_events.append({
+                    'timestamp': ev['timestamp'].isoformat() if hasattr(ev['timestamp'], 'isoformat') else str(ev['timestamp']),
+                    'remaining_soe': ev['remaining_soe'],
+                    'excess_above_min_pct': ev['excess_above_min_pct'],
+                    'excess_energy_kwh': ev['excess_energy_kwh'],
+                    'note': ev.get('note')
+                })
+
+            max_excess_pct = max((ev['excess_above_min_pct'] for ev in events), default=0.0) if events else 0.0
+            avg_excess_pct = float(np.mean([ev['excess_above_min_pct'] for ev in events])) if events else 0.0
+            last_event = events[-1] if events else None
+            last_summary = None
+            if last_event:
+                last_summary = {
+                    'timestamp': last_event['timestamp'].isoformat() if hasattr(last_event['timestamp'], 'isoformat') else str(last_event['timestamp']),
+                    'remaining_soe': last_event['remaining_soe'],
+                    'excess_above_min_pct': last_event['excess_above_min_pct'],
+                    'excess_energy_kwh': last_event['excess_energy_kwh'],
+                    'note': last_event.get('note')
+                }
+
+            final_excess_pct = max(0.0, getattr(self, 'tou_final_soe', results_df['soe'].iloc[-1]) - self.controller.soe_min)
+            final_excess_energy = (final_excess_pct / 100) * battery_capacity_mwh * 1000
+
+            time_of_use_report = {
+                'charge_window': self.tou_charge_window,
+                'discharge_window': self.tou_discharge_window,
+                'min_soe_target': self.controller.soe_min,
+                'max_soe_limit': self.controller.soe_max,
+                'leftover_events': simplified_events,
+                'last_leftover': last_summary,
+                'max_excess_pct': max_excess_pct,
+                'avg_excess_pct': avg_excess_pct,
+                'final_excess_pct': final_excess_pct,
+                'final_excess_energy_kwh': final_excess_energy,
+                'battery_capacity_mwh': battery_capacity_mwh
+            }
+        time_of_control_extension = getattr(self, 'time_of_control_extension', None)
         
         return {
             'md_no_pv_no_ems': md_no_pv,
@@ -430,7 +698,10 @@ class EMSEngine:
                 'capacity_kw': inverter_capacity,
                 'energy_lost_kwh': energy_lost_kwh
             },
-            'include_pv_savings': include_pv_savings  # Add this flag to results
+            'include_pv_savings': include_pv_savings,  # Add this flag to results
+            'control_mode': self.control_mode,
+            'time_of_use_report': time_of_use_report,
+            'time_of_control_extension': time_of_control_extension
         }
     
     def _generate_recommendations(self, analysis):
